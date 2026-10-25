@@ -13,6 +13,6 @@ opentelemetry-sdk>=1.28,<2.0
 opentelemetry-exporter-otlp-proto-http>=1.28,<2.0
 opentelemetry-instrumentation-fastapi>=0.49b0,<1.0
 opentelemetry-instrumentation-httpx>=0.49b0,<1.0
-opentelemetry-instrumentation-sqlalchemy>=0.49b0,<1.0
+opentelemetry-instrumentation-sqlalchemy>=0.66b1,<1.0
 sigstore>=4.5,<5.0
 
