@@ -37,6 +37,7 @@ jobs:
           image: local/deployforge-demo-service:ci
           fail-build: true
           severity-cutoff: high
+          output-format: table
 
   backend:
     name: Backend checks and PostgreSQL migrations
