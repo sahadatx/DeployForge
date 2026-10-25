@@ -1,0 +1,21 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: deployforge-demo-staging
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: deployforge
+    deployforge.io/environment: staging
+spec:
+  project: platform
+  source:
+    repoURL: https://github.com/sahadatx/DeployForge.git
+    targetRevision: deployforge/staging
+    path: examples/demo-service/deploy/k8s/overlays/staging
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: demo-staging
+  syncPolicy:
+    syncOptions:
+      - CreateNamespace=false
+      - ApplyOutOfSyncOnly=true

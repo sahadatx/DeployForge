@@ -1,0 +1,25 @@
+services:
+  demo-service:
+    build:
+      context: .
+    environment:
+      SERVICE_NAME: DeployForge Demo Service
+      APP_VERSION: 1.0.0
+      RELEASE_SHA: local-development
+    ports:
+      - "127.0.0.1:8090:8080"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    init: true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health/ready', timeout=2)"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped

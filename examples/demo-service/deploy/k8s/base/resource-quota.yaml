@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: demo-staging-budget
+  namespace: demo-staging
+spec:
+  hard:
+    requests.cpu: "1500m"
+    requests.memory: 512Mi
+    limits.cpu: "2"
+    limits.memory: 1Gi
+    pods: "6"
+    services: "4"
+    persistentvolumeclaims: "0"

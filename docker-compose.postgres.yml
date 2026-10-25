@@ -1,0 +1,36 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: deployforge
+      POSTGRES_USER: deployforge
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set a URL-safe POSTGRES_PASSWORD before starting PostgreSQL Compose}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - control-plane
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U deployforge -d deployforge"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    environment:
+      DEPLOYFORGE_DATABASE_URL: postgresql+psycopg://deployforge:${POSTGRES_PASSWORD:?Set a URL-safe POSTGRES_PASSWORD before starting PostgreSQL Compose}@postgres:5432/deployforge
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  worker:
+    environment:
+      DEPLOYFORGE_DATABASE_URL: postgresql+psycopg://deployforge:${POSTGRES_PASSWORD:?Set a URL-safe POSTGRES_PASSWORD before starting PostgreSQL Compose}@postgres:5432/deployforge
+    depends_on:
+      api:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres-data:
+
