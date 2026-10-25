@@ -1,4 +1,35 @@
 services:
+  api:
+    group_add:
+      - "${DEPLOYFORGE_LOCAL_SECRET_GID:-1000}"
+    environment:
+      DEPLOYFORGE_BUILD_CALLBACK_SECRET: ""
+      DEPLOYFORGE_BUILD_CALLBACK_SECRET_FILE: /run/secrets/build_callback_secret
+      DEPLOYFORGE_REQUIRE_VERIFIED_SUPPLY_CHAIN: "true"
+      DEPLOYFORGE_ARGOCD_API_URL: ${DEPLOYFORGE_ARGOCD_API_URL:-}
+      DEPLOYFORGE_ARGOCD_AUTH_TOKEN: ""
+      DEPLOYFORGE_ARGOCD_AUTH_TOKEN_FILE: /run/secrets/argocd_read_token
+    secrets:
+      - build_callback_secret
+      - argocd_read_token
+
+  worker:
+    group_add:
+      - "${DEPLOYFORGE_LOCAL_SECRET_GID:-1000}"
+    environment:
+      DEPLOYFORGE_GITHUB_ACTIONS_TOKEN: ""
+      DEPLOYFORGE_GITHUB_ACTIONS_TOKEN_FILE: /run/secrets/github_actions_token
+      DEPLOYFORGE_BUILD_CALLBACK_SECRET: ""
+      DEPLOYFORGE_BUILD_CALLBACK_SECRET_FILE: /run/secrets/build_callback_secret
+      DEPLOYFORGE_REQUIRE_VERIFIED_SUPPLY_CHAIN: "true"
+      DEPLOYFORGE_ARGOCD_API_URL: ${DEPLOYFORGE_ARGOCD_API_URL:-}
+      DEPLOYFORGE_ARGOCD_AUTH_TOKEN: ""
+      DEPLOYFORGE_ARGOCD_AUTH_TOKEN_FILE: /run/secrets/argocd_worker_token
+    secrets:
+      - build_callback_secret
+      - github_actions_token
+      - argocd_worker_token
+
   callback-gateway:
     image: nginxinc/nginx-unprivileged@sha256:f5116ed4606f3eb015dd4a8e28cb9b351476dc0ad4bc6e9f93b19cec130cdf03
     command: ["nginx", "-g", "daemon off;"]
@@ -39,3 +70,13 @@ services:
     profiles:
       - callback-tunnel
     restart: "no"
+
+secrets:
+  build_callback_secret:
+    file: ./secrets/local-staging/build_callback_secret
+  github_actions_token:
+    file: ./secrets/local-staging/github_actions_token
+  argocd_read_token:
+    file: ./secrets/local-staging/argocd_read_token
+  argocd_worker_token:
+    file: ./secrets/local-staging/argocd_worker_token

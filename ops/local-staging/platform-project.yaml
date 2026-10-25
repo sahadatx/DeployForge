@@ -31,3 +31,13 @@ spec:
       kind: PodDisruptionBudget
   orphanedResources:
     warn: true
+  roles:
+    - name: deployforge-reader
+      description: Read status for the DeployForge staging application.
+      policies:
+        - p, proj:platform:deployforge-reader, applications, get, platform/deployforge-demo-staging, allow
+    - name: deployforge-sync
+      description: Read and sync only the DeployForge staging application.
+      policies:
+        - p, proj:platform:deployforge-sync, applications, get, platform/deployforge-demo-staging, allow
+        - p, proj:platform:deployforge-sync, applications, sync, platform/deployforge-demo-staging, allow
