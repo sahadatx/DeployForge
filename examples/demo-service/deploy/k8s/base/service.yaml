@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: deployforge-demo-service
+  namespace: demo-staging
+  labels:
+    app.kubernetes.io/name: deployforge-demo-service
+    app.kubernetes.io/part-of: deployforge-demo
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: deployforge-demo-service
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
