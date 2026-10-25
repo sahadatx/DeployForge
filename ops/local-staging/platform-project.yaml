@@ -1,0 +1,33 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: platform
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: deployforge
+    deployforge.io/managed-by: local-staging-setup
+spec:
+  description: Restricted project for the DeployForge local staging workload.
+  sourceRepos:
+    - https://github.com/sahadatx/DeployForge.git
+  destinations:
+    - namespace: demo-staging
+      server: https://kubernetes.default.svc
+  clusterResourceWhitelist:
+    # The sample Kustomize overlay owns its namespace and applies restricted
+    # Pod Security labels. The source repository is limited above.
+    - group: ""
+      kind: Namespace
+  namespaceResourceWhitelist:
+    - group: ""
+      kind: LimitRange
+    - group: ""
+      kind: ResourceQuota
+    - group: ""
+      kind: Service
+    - group: apps
+      kind: Deployment
+    - group: policy
+      kind: PodDisruptionBudget
+  orphanedResources:
+    warn: true
