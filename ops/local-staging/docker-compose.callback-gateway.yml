@@ -1,0 +1,41 @@
+services:
+  callback-gateway:
+    image: nginxinc/nginx-unprivileged@sha256:f5116ed4606f3eb015dd4a8e28cb9b351476dc0ad4bc6e9f93b19cec130cdf03
+    command: ["nginx", "-g", "daemon off;"]
+    network_mode: host
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid,nodev
+    volumes:
+      - ./ops/local-staging/callback-gateway.conf:/etc/nginx/conf.d/default.conf:ro
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    profiles:
+      - callback-tunnel
+    restart: "no"
+
+  callback-tunnel:
+    image: cloudflare/cloudflared@sha256:9b49eed8f62806d5d45ddf59ecefb5710429598ea6d3fcccd2af938f621b2b07
+    command:
+      - tunnel
+      - --no-autoupdate
+      - --protocol
+      - http2
+      - --url
+      - http://127.0.0.1:8080
+    network_mode: host
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      callback-gateway:
+        condition: service_started
+    profiles:
+      - callback-tunnel
+    restart: "no"

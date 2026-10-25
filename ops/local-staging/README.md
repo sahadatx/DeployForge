@@ -39,3 +39,22 @@ must not be deployed as a real release.
 Do not create or sync the staging Application until that generated branch
 exists and contains a verified image digest. The GitHub callback and provider
 credentials must also be configured before starting a DeployForge release.
+
+## Optional temporary GitHub callback path
+
+The callback gateway is an opt-in local development profile. Its listener is
+bound to host loopback, and the API and dashboard ports in the base Compose
+stack are also loopback-only. The gateway forwards only:
+
+- `POST /api/v1/build-runs/{uuid}/callback` to the HMAC-verified DeployForge
+  callback handler;
+- `GET /api/v1/applications/deployforge-demo-staging` to Argo CD; and
+- `POST /api/v1/applications/deployforge-demo-staging/sync` to Argo CD.
+
+Every other path returns `404`. The Argo CD API route still requires the
+worker's scoped bearer token. Start a loopback-only Argo port-forward on
+`127.0.0.1:18443` before starting the gateway profile (port 8443 is already
+used by another local service on this host). The profile includes an
+opt-in Cloudflare Quick Tunnel; it must not be started until an operator is
+ready to publish these three routes temporarily. Quick Tunnel URLs are public,
+temporary, and intended for testing, not production hosting.
