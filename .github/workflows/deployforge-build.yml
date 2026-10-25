@@ -1,0 +1,211 @@
+name: DeployForge Demo Service Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: DeployForge build run UUID
+        required: true
+        type: string
+      deployment_id:
+        description: DeployForge deployment UUID
+        required: true
+        type: string
+      source_ref:
+        description: Protected main branch requested by DeployForge
+        required: true
+        type: string
+      callback_url:
+        description: Signed build-result callback endpoint
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: deployforge-demo-staging-gitops
+  cancel-in-progress: false
+
+jobs:
+  build-scan-sign:
+    name: Build, scan, attest, and report
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    env:
+      DEPLOYFORGE_CALLBACK_URL: ${{ inputs.callback_url }}
+      BUILD_RUN_ID: ${{ inputs.build_run_id }}
+      DEPLOYMENT_ID: ${{ inputs.deployment_id }}
+      SOURCE_REF: ${{ inputs.source_ref }}
+    steps:
+      - name: Check out the requested source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate the trusted DeployForge callback destination
+        env:
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+          DEPLOYFORGE_CALLBACK_URL: ${{ inputs.callback_url }}
+          DEPLOYFORGE_CALLBACK_ALLOWED_HOST: ${{ vars.DEPLOYFORGE_CALLBACK_ALLOWED_HOST }}
+        run: python3 examples/demo-service/scripts/report-build.py --validate-callback
+
+      - name: Validate release inputs and bind source revision
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$DEPLOYFORGE_CALLBACK_URL" == https://* ]] || {
+            echo "DeployForge callback URL must use HTTPS." >&2
+            exit 1
+          }
+          [[ -n "$BUILD_RUN_ID" && -n "$DEPLOYMENT_ID" && -n "$SOURCE_REF" ]] || {
+            echo "DeployForge release identifiers are required." >&2
+            exit 1
+          }
+          [[ "$GITHUB_REF" == "refs/heads/main" ]] || {
+            echo "The staging release workflow accepts only protected main." >&2
+            exit 1
+          }
+          commit_sha="$(git rev-parse HEAD)"
+          [[ "$commit_sha" == "$GITHUB_SHA" ]] || {
+            echo "Checked-out source does not match the workflow-dispatch revision." >&2
+            exit 1
+          }
+          echo "commit_sha=$commit_sha" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}-demo-service" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@f4ef78c080cd8ba55a85445d5b36e214a81df20a # v3.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+
+      - name: Build and publish the immutable source-tagged image
+        id: image
+        uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7.0.0
+        with:
+          context: examples/demo-service
+          file: examples/demo-service/Dockerfile
+          push: true
+          tags: ${{ steps.source.outputs.image }}:sha-${{ steps.source.outputs.commit_sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.source.outputs.commit_sha }}
+          cache-from: type=gha,scope=demo-service
+          cache-to: type=gha,scope=demo-service,mode=max
+
+      - name: Pull the exact image digest for analysis
+        env:
+          IMAGE: ${{ steps.source.outputs.image }}
+          DIGEST: ${{ steps.image.outputs.digest }}
+        run: docker pull "${IMAGE}@${DIGEST}"
+
+      - name: Generate CycloneDX SBOM from the published image
+        id: sbom
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ${{ steps.source.outputs.image }}@${{ steps.image.outputs.digest }}
+          format: cyclonedx-json
+          output-file: demo-service.cdx.json
+          upload-artifact: true
+          upload-release-assets: false
+
+      - name: Scan the exact image digest for vulnerabilities
+        id: scan
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
+        with:
+          image: ${{ steps.source.outputs.image }}@${{ steps.image.outputs.digest }}
+          output-format: json
+          output-file: grype.json
+          fail-build: true
+          severity-cutoff: high
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.4
+
+      - name: Sign the immutable image digest with Sigstore
+        id: signature
+        env:
+          IMAGE: ${{ steps.source.outputs.image }}
+          DIGEST: ${{ steps.image.outputs.digest }}
+        run: cosign sign --yes --bundle image.sigstore.json "${IMAGE}@${DIGEST}"
+
+      - name: Attest SLSA build provenance
+        id: provenance
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-name: ${{ steps.source.outputs.image }}
+          subject-digest: ${{ steps.image.outputs.digest }}
+          push-to-registry: true
+
+      - name: Attest the image SBOM
+        id: sbom-attestation
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-name: ${{ steps.source.outputs.image }}
+          subject-digest: ${{ steps.image.outputs.digest }}
+          sbom-path: demo-service.cdx.json
+          push-to-registry: true
+
+      - name: Prepare the immutable staging GitOps revision
+        id: gitops
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE_COMMIT_SHA: ${{ steps.source.outputs.commit_sha }}
+          IMAGE: ${{ steps.source.outputs.image }}
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh auth setup-git
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git ls-remote --exit-code --heads origin deployforge/staging >/dev/null 2>&1; then
+            git fetch --no-tags origin refs/heads/deployforge/staging:refs/remotes/origin/deployforge/staging
+            git checkout -B deployforge/staging refs/remotes/origin/deployforge/staging
+            git merge --no-edit "$SOURCE_COMMIT_SHA"
+          else
+            git checkout -B deployforge/staging "$SOURCE_COMMIT_SHA"
+          fi
+
+          python3 examples/demo-service/scripts/update-staging-digest.py \
+            examples/demo-service/deploy/k8s/overlays/staging/kustomization.yaml \
+            "$IMAGE" "$IMAGE_DIGEST"
+          git add examples/demo-service/deploy/k8s/overlays/staging/kustomization.yaml
+          if ! git diff --cached --quiet; then
+            git commit -m "deploy(staging): pin demo service ${IMAGE_DIGEST}"
+          fi
+          git push origin HEAD:refs/heads/deployforge/staging
+          echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Report the terminal result to DeployForge
+        if: ${{ always() }}
+        env:
+          BUILD_STATUS: ${{ job.status }}
+          SOURCE_COMMIT_SHA: ${{ steps.source.outputs.commit_sha || github.sha }}
+          GITOPS_REVISION: ${{ steps.gitops.outputs.revision }}
+          IMAGE: ${{ steps.source.outputs.image }}
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+          PROVENANCE_URI: ${{ steps.provenance.outputs.attestation-url }}
+          SIGNATURE_BUNDLE_PATH: image.sigstore.json
+          PROVENANCE_BUNDLE_PATH: ${{ steps.provenance.outputs.bundle-path }}
+          SBOM_PATH: demo-service.cdx.json
+          VULNERABILITY_REPORT_PATH: grype.json
+          DEPLOYFORGE_CALLBACK_ALLOWED_HOST: ${{ vars.DEPLOYFORGE_CALLBACK_ALLOWED_HOST }}
+          DEPLOYFORGE_CALLBACK_SECRET: ${{ secrets.DEPLOYFORGE_CALLBACK_SECRET }}
+        run: python3 examples/demo-service/scripts/report-build.py

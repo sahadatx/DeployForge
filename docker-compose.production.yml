@@ -1,0 +1,165 @@
+name: deployforge-production
+
+services:
+  apk-parser:
+    profiles:
+      - optional-parser
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: deployforge
+      POSTGRES_USER: deployforge_bootstrap
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+      - app_database_password
+    volumes:
+      - deployforge-production-postgres-data:/var/lib/postgresql/data
+      - ./scripts/create-app-database-role.sh:/docker-entrypoint-initdb.d/10-create-app-database-role.sh:ro
+    networks: !override
+      - database-internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U deployforge -d deployforge"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  api:
+    environment:
+      DEPLOYFORGE_APP_ENV: production
+      DEPLOYFORGE_RUNTIME_ROLE: api
+      DEPLOYFORGE_DATABASE_URL: ""
+      DEPLOYFORGE_DATABASE_URL_FILE: /run/secrets/database_url
+      DEPLOYFORGE_SESSION_SECRET: ""
+      DEPLOYFORGE_SESSION_SECRET_FILE: /run/secrets/session_secret
+      DEPLOYFORGE_SESSION_COOKIE_SECURE: "true"
+      DEPLOYFORGE_OIDC_CLIENT_SECRET: ""
+      DEPLOYFORGE_OIDC_CLIENT_SECRET_FILE: /run/secrets/oidc_client_secret
+      DEPLOYFORGE_GITHUB_ACTIONS_TOKEN: ""
+      DEPLOYFORGE_BUILD_CALLBACK_SECRET: ""
+      DEPLOYFORGE_BUILD_CALLBACK_SECRET_FILE: /run/secrets/build_callback_secret
+      DEPLOYFORGE_BUILD_CALLBACK_PUBLIC_URL: ""
+      DEPLOYFORGE_ARGOCD_AUTH_TOKEN: ""
+      DEPLOYFORGE_ARGOCD_API_URL: ""
+      DEPLOYFORGE_REQUIRE_VERIFIED_SUPPLY_CHAIN: "true"
+      DEPLOYFORGE_DEV_AUTH_ENABLED: "false"
+      DEPLOYFORGE_DEV_AUTH_AUTO_ADMIN_FIRST_USER: "false"
+    secrets:
+      - database_url
+      - session_secret
+      - oidc_client_secret
+      - build_callback_secret
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports: !reset []
+    volumes: !override []
+    networks: !override
+      - control-plane
+      - parser-isolated
+      - database-internal
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,noexec,nosuid,nodev
+      - /home/appuser/.cache:size=64m,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    init: true
+    restart: unless-stopped
+
+  worker:
+    environment:
+      DEPLOYFORGE_APP_ENV: production
+      DEPLOYFORGE_RUNTIME_ROLE: worker
+      DEPLOYFORGE_DATABASE_URL: ""
+      DEPLOYFORGE_DATABASE_URL_FILE: /run/secrets/database_url
+      DEPLOYFORGE_SESSION_SECRET: ""
+      DEPLOYFORGE_OIDC_CLIENT_SECRET: ""
+      DEPLOYFORGE_OIDC_DISCOVERY_URL: ""
+      DEPLOYFORGE_OIDC_CLIENT_ID: ""
+      DEPLOYFORGE_OIDC_REDIRECT_URI: ""
+      DEPLOYFORGE_OIDC_ADMIN_EMAILS: ""
+      DEPLOYFORGE_GITHUB_ACTIONS_TOKEN: ""
+      DEPLOYFORGE_GITHUB_ACTIONS_TOKEN_FILE: /run/secrets/github_actions_token
+      DEPLOYFORGE_BUILD_CALLBACK_SECRET: ""
+      DEPLOYFORGE_ARGOCD_AUTH_TOKEN: ""
+      DEPLOYFORGE_ARGOCD_AUTH_TOKEN_FILE: /run/secrets/argocd_auth_token
+      DEPLOYFORGE_SESSION_COOKIE_SECURE: "true"
+      DEPLOYFORGE_DEV_AUTH_ENABLED: "false"
+      DEPLOYFORGE_DEV_AUTH_AUTO_ADMIN_FIRST_USER: "false"
+    secrets:
+      - database_url
+      - github_actions_token
+      - argocd_auth_token
+    depends_on:
+      postgres:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    volumes: !override []
+    networks: !override
+      - control-plane
+      - parser-isolated
+      - database-internal
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,noexec,nosuid,nodev
+      - /home/appuser/.cache:size=64m,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    init: true
+    restart: unless-stopped
+
+  dashboard:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.production
+    environment: !override {}
+    ports: !override
+      - "127.0.0.1:8080:8080"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    init: true
+    healthcheck:
+      test: ["CMD", "/bin/sh", "-c", "wget -q -O /dev/null http://127.0.0.1:8080/"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+secrets:
+  postgres_password:
+    file: ./secrets/postgres_password
+  app_database_password:
+    file: ./secrets/app_database_password
+  database_url:
+    file: ./secrets/database_url
+  session_secret:
+    file: ./secrets/session_secret
+  oidc_client_secret:
+    file: ./secrets/oidc_client_secret
+  build_callback_secret:
+    file: ./secrets/build_callback_secret
+  github_actions_token:
+    file: ./secrets/github_actions_token
+  argocd_auth_token:
+    file: ./secrets/argocd_auth_token
+
+networks:
+  database-internal:
+    internal: true
+
+volumes:
+  deployforge-production-postgres-data:
