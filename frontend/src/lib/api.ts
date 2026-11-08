@@ -36,7 +36,80 @@ export async function apiGet<T>(path: string, signal?: AbortSignal): Promise<T> 
   return (await response.json()) as T;
 }
 
-async function apiWrite<T>(path: string, method: "POST" | "PATCH" | "DELETE", body?: unknown): Promise<T> {
+function collectionPagePath(path: string, limit: number, offset: number) {
+  const queryStart = path.indexOf("?");
+  const pathname = queryStart < 0 ? path : path.slice(0, queryStart);
+  const query = new URLSearchParams(queryStart < 0 ? "" : path.slice(queryStart + 1));
+  query.set("limit", String(limit));
+  query.set("offset", String(offset));
+  return `${pathname}?${query.toString()}`;
+}
+
+function appendDistinctRecords<T>(items: T[], page: T[], seenIds: Set<string>) {
+  let added = 0;
+  for (const item of page) {
+    const id = item && typeof item === "object" && "id" in item ? item.id : undefined;
+    const key = typeof id === "string" || typeof id === "number" ? `${typeof id}:${id}` : null;
+    if (key !== null && seenIds.has(key)) continue;
+    if (key !== null) seenIds.add(key);
+    items.push(item);
+    added += 1;
+  }
+  return added;
+}
+
+function appendCollectionPage<T>(items: T[], page: T[], seenIds: Set<string>, seenPages: Set<string>) {
+  if (!page.length) return;
+  const signature = JSON.stringify(page);
+  if (seenPages.has(signature) || appendDistinctRecords(items, page, seenIds) === 0) {
+    throw new Error("The API repeated a collection page. Refresh to retry loading the complete list.");
+  }
+  seenPages.add(signature);
+}
+
+/** Load an offset-based array endpoint without silently truncating its history. */
+export async function apiGetAll<T>(path: string, signal?: AbortSignal, pageSize = 100): Promise<T[]> {
+  if (!Number.isSafeInteger(pageSize) || pageSize < 1) throw new RangeError("Page size must be a positive integer.");
+  const items: T[] = [];
+  const seenIds = new Set<string>();
+  const seenPages = new Set<string>();
+  let offset = 0;
+  while (true) {
+    signal?.throwIfAborted();
+    const page = await apiGet<T[]>(collectionPagePath(path, pageSize, offset), signal);
+    signal?.throwIfAborted();
+    if (!Array.isArray(page)) throw new Error("The API did not return a record list.");
+    appendCollectionPage(items, page, seenIds, seenPages);
+    if (page.length < pageSize) return items;
+    offset += page.length;
+  }
+}
+
+/** Load all catalog pages for service lookups and form options. */
+export async function apiGetAllServices(path: string, signal?: AbortSignal): Promise<ServiceCatalog> {
+  const items: ServiceRecord[] = [];
+  const seenIds = new Set<string>();
+  const seenPages = new Set<string>();
+  let offset = 0;
+  while (true) {
+    signal?.throwIfAborted();
+    const page = await apiGet<ServiceCatalog>(collectionPagePath(path, 100, offset), signal);
+    signal?.throwIfAborted();
+    if (!page || !Array.isArray(page.items) || !Number.isSafeInteger(page.total) || page.total < 0) {
+      throw new Error("The API did not return a valid service catalog page.");
+    }
+    appendCollectionPage(items, page.items, seenIds, seenPages);
+    offset += page.items.length;
+    if (offset >= page.total) {
+      // Counts can change between requests; describe the deduplicated snapshot
+      // returned here rather than mixing it with a later server count.
+      return { items, total: items.length, limit: items.length, offset: 0 };
+    }
+    if (!page.items.length) throw new Error("The API returned an incomplete service catalog. Refresh to retry loading the complete list.");
+  }
+}
+
+async function apiWrite<T>(path: string, method: "POST" | "PUT" | "PATCH" | "DELETE", body?: unknown): Promise<T> {
   const headers: Record<string, string> = { Accept: "application/json" };
   if (csrfToken) headers["X-CSRF-Token"] = csrfToken;
   if (body !== undefined) headers["Content-Type"] = "application/json";
