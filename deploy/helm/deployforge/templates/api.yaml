@@ -1,0 +1,115 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "deployforge.fullname" . }}-api
+  labels:
+    {{- include "deployforge.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  replicas: {{ .Values.replicas.api }}
+  selector:
+    matchLabels:
+      {{- include "deployforge.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: api
+  template:
+    metadata:
+      labels:
+        {{- include "deployforge.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: api
+    spec:
+      serviceAccountName: {{ include "deployforge.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      {{- include "deployforge.imagePullSecrets" . | nindent 6 }}
+      {{- include "deployforge.podSecurityContext" . | nindent 6 }}
+      containers:
+        - name: api
+          image: "{{- if .Values.images.api.digest }}{{ .Values.images.api.repository }}@{{ .Values.images.api.digest }}{{- else }}{{ .Values.images.api.repository }}:{{ .Values.images.api.tag }}{{- end }}"
+          imagePullPolicy: {{ .Values.images.api.pullPolicy }}
+          {{- include "deployforge.containerSecurityContext" . | nindent 10 }}
+          command: ["uvicorn"]
+          args: ["app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          env:
+            - name: DEPLOYFORGE_APP_ENV
+              value: production
+            - name: DEPLOYFORGE_RUNTIME_ROLE
+              value: api
+            - name: DEPLOYFORGE_BUILD_PROVIDER
+              value: {{ .Values.config.buildProvider | quote }}
+            - name: DEPLOYFORGE_LOG_LEVEL
+              value: {{ .Values.config.logLevel | quote }}
+            {{- include "deployforge.databaseEnv" . | nindent 12 }}
+            - name: DEPLOYFORGE_SESSION_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.existingSecret | quote }}
+                  key: {{ .Values.secrets.keys.sessionSecret | quote }}
+            - name: DEPLOYFORGE_SESSION_COOKIE_SECURE
+              value: "true"
+            - name: DEPLOYFORGE_SESSION_COOKIE_NAME
+              value: {{ .Values.config.sessionCookieName | quote }}
+            - name: DEPLOYFORGE_SESSION_TTL_SECONDS
+              value: {{ .Values.config.sessionTtlSeconds | quote }}
+            - name: DEPLOYFORGE_OIDC_DISCOVERY_URL
+              value: {{ .Values.config.oidc.discoveryUrl | quote }}
+            - name: DEPLOYFORGE_OIDC_CLIENT_ID
+              value: {{ .Values.config.oidc.clientId | quote }}
+            - name: DEPLOYFORGE_OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.existingSecret | quote }}
+                  key: {{ .Values.secrets.keys.oidcClientSecret | quote }}
+            - name: DEPLOYFORGE_OIDC_REDIRECT_URI
+              value: {{ .Values.config.oidc.redirectUri | quote }}
+            - name: DEPLOYFORGE_FRONTEND_BASE_URL
+              value: {{ .Values.config.frontendBaseUrl | quote }}
+            - name: DEPLOYFORGE_BUILD_CALLBACK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.existingSecret | quote }}
+                  key: {{ .Values.secrets.keys.buildCallbackSecret | quote }}
+            - name: DEPLOYFORGE_GITHUB_ACTIONS_WORKFLOW_PATH
+              value: {{ .Values.config.github.workflowPath | quote }}
+            - name: DEPLOYFORGE_INFRASTRUCTURE_WORKFLOW_PATH
+              value: {{ .Values.config.github.infrastructureWorkflowPath | quote }}
+            - name: DEPLOYFORGE_BUILD_CALLBACK_PUBLIC_URL
+              value: {{ .Values.config.github.callbackPublicUrl | quote }}
+            - name: DEPLOYFORGE_BUILD_CALLBACK_TIMEOUT_SECONDS
+              value: {{ .Values.config.github.callbackTimeoutSeconds | quote }}
+          {{- with .Values.resources.api }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "deployforge.fullname" . }}-api
+  labels:
+    {{- include "deployforge.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "deployforge.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: api

@@ -1,0 +1,7 @@
+apiVersion: v2
+name: deployforge
+description: DeployForge API, worker and dashboard on Kubernetes
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/sahadatx/DeployForge

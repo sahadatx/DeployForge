@@ -1,0 +1,101 @@
+nameOverride: ""
+fullnameOverride: ""
+
+images:
+  api:
+    repository: ghcr.io/sahadatx/deployforge-api
+    tag: "0.1.0"
+    digest: ""
+    pullPolicy: IfNotPresent
+  worker:
+    repository: ghcr.io/sahadatx/deployforge-api
+    tag: "0.1.0"
+    digest: ""
+    pullPolicy: IfNotPresent
+  dashboard:
+    repository: ghcr.io/sahadatx/deployforge-dashboard
+    tag: "0.1.0"
+    digest: ""
+    pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+replicas:
+  api: 1
+  worker: 1
+  dashboard: 1
+
+database:
+  # Supply a managed PostgreSQL URL through the cluster secret manager.
+  existingSecret: deployforge-runtime
+  urlKey: database_url
+
+secrets:
+  existingSecret: deployforge-runtime
+  keys:
+    sessionSecret: session_secret
+    oidcClientSecret: oidc_client_secret
+    buildCallbackSecret: build_callback_secret
+    githubActionsToken: github_actions_token
+    argocdAuthToken: argocd_auth_token
+
+config:
+  buildProvider: github_actions
+  logLevel: INFO
+  frontendBaseUrl: https://deployforge.example.com
+  sessionCookieName: deployforge_session
+  sessionTtlSeconds: 43200
+  oidc:
+    discoveryUrl: https://identity.example.com/.well-known/openid-configuration
+    clientId: deployforge
+    redirectUri: https://deployforge.example.com/api/v1/auth/callback
+  github:
+    enabled: false
+    apiUrl: https://api.github.com
+    serverUrl: https://github.com
+    workflowPath: .github/workflows/deployforge-build.yml
+    infrastructureWorkflowPath: .github/workflows/deployforge-infrastructure.yml
+    callbackPublicUrl: https://deployforge.example.com
+    callbackTimeoutSeconds: 14400
+  argocd:
+    enabled: false
+    apiUrl: ""
+    apiTimeoutSeconds: 15
+    syncTimeoutSeconds: 1800
+    reconcileIntervalSeconds: 10
+  workerHeartbeatIntervalSeconds: 10
+  workerHeartbeatStaleAfterSeconds: 30
+  telemetryRetentionDays: 31
+  telemetry:
+    otlpEndpoint: ""
+    otlpTracesEndpoint: ""
+    otlpMetricsEndpoint: ""
+    otlpHeaders: ""
+
+resources:
+  api:
+    requests: { cpu: 250m, memory: 384Mi }
+    limits: { cpu: "2", memory: 1Gi }
+  worker:
+    requests: { cpu: 250m, memory: 384Mi }
+    limits: { cpu: "2", memory: 1Gi }
+  dashboard:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { cpu: 500m, memory: 256Mi }
+
+ingress:
+  enabled: false
+  className: nginx
+  annotations: {}
+  host: deployforge.example.com
+  tls:
+    enabled: true
+    secretName: deployforge-tls
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

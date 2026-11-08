@@ -1,0 +1,97 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "deployforge.fullname" . }}-nginx
+  labels:
+    {{- include "deployforge.labels" . | nindent 4 }}
+data:
+  default.conf: {{ tpl (.Files.Get "files/default.conf") . | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "deployforge.fullname" . }}-dashboard
+  labels:
+    {{- include "deployforge.labels" . | nindent 4 }}
+    app.kubernetes.io/component: dashboard
+spec:
+  replicas: {{ .Values.replicas.dashboard }}
+  selector:
+    matchLabels:
+      {{- include "deployforge.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: dashboard
+  template:
+    metadata:
+      labels:
+        {{- include "deployforge.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: dashboard
+    spec:
+      serviceAccountName: {{ include "deployforge.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      {{- include "deployforge.imagePullSecrets" . | nindent 6 }}
+      {{- include "deployforge.podSecurityContext" . | nindent 6 }}
+      containers:
+        - name: dashboard
+          image: "{{- if .Values.images.dashboard.digest }}{{ .Values.images.dashboard.repository }}@{{ .Values.images.dashboard.digest }}{{- else }}{{ .Values.images.dashboard.repository }}:{{ .Values.images.dashboard.tag }}{{- end }}"
+          imagePullPolicy: {{ .Values.images.dashboard.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 101
+            runAsGroup: 101
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          volumeMounts:
+            - name: nginx-config
+              mountPath: /etc/nginx/conf.d/default.conf
+              subPath: default.conf
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          {{- with .Values.resources.dashboard }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        - name: nginx-config
+          configMap:
+            name: {{ include "deployforge.fullname" . }}-nginx
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "deployforge.fullname" . }}-dashboard
+  labels:
+    {{- include "deployforge.labels" . | nindent 4 }}
+    app.kubernetes.io/component: dashboard
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "deployforge.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: dashboard

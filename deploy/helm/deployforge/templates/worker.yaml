@@ -1,0 +1,107 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "deployforge.fullname" . }}-worker
+  labels:
+    {{- include "deployforge.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  replicas: {{ .Values.replicas.worker }}
+  selector:
+    matchLabels:
+      {{- include "deployforge.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: worker
+  template:
+    metadata:
+      labels:
+        {{- include "deployforge.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: worker
+    spec:
+      serviceAccountName: {{ include "deployforge.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      {{- include "deployforge.imagePullSecrets" . | nindent 6 }}
+      {{- include "deployforge.podSecurityContext" . | nindent 6 }}
+      containers:
+        - name: worker
+          image: "{{- if .Values.images.worker.digest }}{{ .Values.images.worker.repository }}@{{ .Values.images.worker.digest }}{{- else }}{{ .Values.images.worker.repository }}:{{ .Values.images.worker.tag }}{{- end }}"
+          imagePullPolicy: {{ .Values.images.worker.pullPolicy }}
+          {{- include "deployforge.containerSecurityContext" . | nindent 10 }}
+          command: ["python"]
+          args: ["-m", "app.worker"]
+          env:
+            - name: DEPLOYFORGE_APP_ENV
+              value: production
+            - name: DEPLOYFORGE_RUNTIME_ROLE
+              value: worker
+            - name: DEPLOYFORGE_BUILD_PROVIDER
+              value: {{ .Values.config.buildProvider | quote }}
+            - name: DEPLOYFORGE_LOG_LEVEL
+              value: {{ .Values.config.logLevel | quote }}
+            {{- include "deployforge.databaseEnv" . | nindent 12 }}
+            - name: DEPLOYFORGE_BUILD_CALLBACK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.existingSecret | quote }}
+                  key: {{ .Values.secrets.keys.buildCallbackSecret | quote }}
+            - name: DEPLOYFORGE_BUILD_CALLBACK_PUBLIC_URL
+              value: {{ .Values.config.github.callbackPublicUrl | quote }}
+            - name: DEPLOYFORGE_BUILD_CALLBACK_TIMEOUT_SECONDS
+              value: {{ .Values.config.github.callbackTimeoutSeconds | quote }}
+            - name: DEPLOYFORGE_WORKER_HEARTBEAT_INTERVAL_SECONDS
+              value: {{ .Values.config.workerHeartbeatIntervalSeconds | quote }}
+            - name: DEPLOYFORGE_WORKER_HEARTBEAT_STALE_AFTER_SECONDS
+              value: {{ .Values.config.workerHeartbeatStaleAfterSeconds | quote }}
+            - name: DEPLOYFORGE_TELEMETRY_RETENTION_DAYS
+              value: {{ .Values.config.telemetryRetentionDays | quote }}
+          {{- if .Values.config.github.enabled }}
+            - name: DEPLOYFORGE_GITHUB_API_URL
+              value: {{ .Values.config.github.apiUrl | quote }}
+            - name: DEPLOYFORGE_GITHUB_SERVER_URL
+              value: {{ .Values.config.github.serverUrl | quote }}
+            - name: DEPLOYFORGE_GITHUB_ACTIONS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.existingSecret | quote }}
+                  key: {{ .Values.secrets.keys.githubActionsToken | quote }}
+          {{- end }}
+          {{- if .Values.config.argocd.enabled }}
+            - name: DEPLOYFORGE_ARGOCD_API_URL
+              value: {{ .Values.config.argocd.apiUrl | quote }}
+            - name: DEPLOYFORGE_ARGOCD_API_TIMEOUT_SECONDS
+              value: {{ .Values.config.argocd.apiTimeoutSeconds | quote }}
+            - name: DEPLOYFORGE_GITOPS_SYNC_TIMEOUT_SECONDS
+              value: {{ .Values.config.argocd.syncTimeoutSeconds | quote }}
+            - name: DEPLOYFORGE_GITOPS_RECONCILE_INTERVAL_SECONDS
+              value: {{ .Values.config.argocd.reconcileIntervalSeconds | quote }}
+            - name: DEPLOYFORGE_ARGOCD_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.existingSecret | quote }}
+                  key: {{ .Values.secrets.keys.argocdAuthToken | quote }}
+          {{- end }}
+          {{- with .Values.config.telemetry }}
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: {{ .otlpEndpoint | quote }}
+            - name: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
+              value: {{ .otlpTracesEndpoint | quote }}
+            - name: OTEL_EXPORTER_OTLP_METRICS_ENDPOINT
+              value: {{ .otlpMetricsEndpoint | quote }}
+            - name: OTEL_EXPORTER_OTLP_HEADERS
+              value: {{ .otlpHeaders | quote }}
+          {{- end }}
+          {{- with .Values.resources.worker }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
