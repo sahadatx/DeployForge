@@ -83,7 +83,7 @@ jobs:
           echo "image=ghcr.io/${GITHUB_REPOSITORY,,}-demo-service" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@f4ef78c080cd8ba55a85445d5b36e214a81df20a # v3.6.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v3.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
