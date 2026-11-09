@@ -25,9 +25,21 @@ serviceAccount:
   annotations: {}
 
 replicas:
-  api: 1
+  api: 2
   worker: 1
   dashboard: 1
+
+autoscaling:
+  api:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 8
+    targetCPUUtilizationPercentage: 70
+
+podDisruptionBudget:
+  api:
+    enabled: true
+    minAvailable: 1
 
 database:
   # Supply a managed PostgreSQL URL through the cluster secret manager.

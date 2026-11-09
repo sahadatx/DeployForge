@@ -29,4 +29,4 @@ helm upgrade --install deployforge deploy/helm/deployforge \
 
 Only the dashboard Service is routed by the optional Ingress. Nginx proxies `/api/v1/` to the internal API Service. The chart creates no Kubernetes Secret containing credentials; use a cluster secret manager and bind only the required registry pull credentials to the release.
 
-The initial chart uses one replica per component. Configure and validate capacity, database connection limits, backups, and recovery with the operations owners before production traffic.
+The API starts with two replicas, uses readiness, liveness, and startup probes, and can scale from two to eight replicas based on CPU. Its disruption budget keeps at least one API pod available during voluntary cluster maintenance. The worker and dashboard remain at one replica in this chart configuration. Set HPA bounds against measured database connection limits before production traffic.
