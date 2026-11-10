@@ -1,0 +1,60 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "deployforge.fullname" . }}-migrate-{{ .Release.Revision }}
+  labels:
+    {{- include "deployforge.labels" . | nindent 4 }}
+    app.kubernetes.io/component: migration
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-5"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: 900
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        {{- include "deployforge.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: migration
+    spec:
+      restartPolicy: Never
+      serviceAccountName: default
+      automountServiceAccountToken: false
+      {{- include "deployforge.imagePullSecrets" . | nindent 6 }}
+      {{- include "deployforge.podSecurityContext" . | nindent 6 }}
+      containers:
+        - name: migrate
+          image: "{{- if .Values.images.api.digest }}{{ .Values.images.api.repository }}@{{ .Values.images.api.digest }}{{- else }}{{ .Values.images.api.repository }}:{{ .Values.images.api.tag }}{{- end }}"
+          imagePullPolicy: {{ .Values.images.api.pullPolicy }}
+          command: ["alembic", "upgrade", "head"]
+          env:
+            - name: DEPLOYFORGE_APP_ENV
+              value: production
+            # Alembic only needs database settings; worker role avoids requiring
+            # API-only OIDC/session configuration in this one-shot process.
+            - name: DEPLOYFORGE_RUNTIME_ROLE
+              value: worker
+            - name: DEPLOYFORGE_FRONTEND_BASE_URL
+              value: {{ .Values.config.frontendBaseUrl | quote }}
+            - name: DEPLOYFORGE_DEV_AUTH_ENABLED
+              value: "false"
+            - name: DEPLOYFORGE_DEV_AUTH_AUTO_ADMIN_FIRST_USER
+              value: "false"
+            {{- include "deployforge.databaseEnv" . | nindent 12 }}
+          {{- include "deployforge.containerSecurityContext" . | nindent 10 }}
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi

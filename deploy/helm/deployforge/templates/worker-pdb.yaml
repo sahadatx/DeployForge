@@ -1,0 +1,15 @@
+{{- if .Values.podDisruptionBudget.worker.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "deployforge.fullname" . }}-worker
+  labels:
+    {{- include "deployforge.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.worker.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "deployforge.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: worker
+{{- end }}

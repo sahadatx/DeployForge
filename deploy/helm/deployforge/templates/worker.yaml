@@ -6,7 +6,14 @@ metadata:
     {{- include "deployforge.labels" . | nindent 4 }}
     app.kubernetes.io/component: worker
 spec:
+  {{- if not .Values.autoscaling.worker.enabled }}
   replicas: {{ .Values.replicas.worker }}
+  {{- end }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   selector:
     matchLabels:
       {{- include "deployforge.selectorLabels" . | nindent 6 }}
@@ -19,8 +26,24 @@ spec:
     spec:
       serviceAccountName: {{ include "deployforge.serviceAccountName" . }}
       automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60
       {{- include "deployforge.imagePullSecrets" . | nindent 6 }}
       {{- include "deployforge.podSecurityContext" . | nindent 6 }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "deployforge.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: worker
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "deployforge.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: worker
       containers:
         - name: worker
           image: "{{- if .Values.images.worker.digest }}{{ .Values.images.worker.repository }}@{{ .Values.images.worker.digest }}{{- else }}{{ .Values.images.worker.repository }}:{{ .Values.images.worker.tag }}{{- end }}"
