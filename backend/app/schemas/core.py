@@ -1223,6 +1223,8 @@ class WorkspaceMemberContract(BaseModel):
     membership_id: UUID
     user: UserContract
     role: WorkspaceRole
+    identity_source: str
+    identity_groups: list[str]
     created_at: datetime
 
 

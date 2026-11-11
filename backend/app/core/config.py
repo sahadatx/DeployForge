@@ -1,3 +1,4 @@
+import json
 import os
 import re
 from functools import lru_cache
@@ -61,6 +62,8 @@ class Settings(BaseSettings):
     oidc_client_secret: SecretStr | None = None
     oidc_redirect_uri: str = ""
     oidc_admin_emails: str = ""
+    oidc_group_claim: str = "groups"
+    oidc_group_role_mappings: str = "{}"
     frontend_base_url: str = "http://localhost:5173"
     dev_auth_enabled: bool = False
     dev_auth_auto_admin_first_user: bool = False
@@ -177,6 +180,42 @@ class Settings(BaseSettings):
             return None
         normalized = str(value).strip()
         return normalized or None
+
+    @field_validator("oidc_group_claim")
+    @classmethod
+    def validate_oidc_group_claim(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized or len(normalized) > 255:
+            raise ValueError("DEPLOYFORGE_OIDC_GROUP_CLAIM must contain 1 to 255 characters")
+        return normalized
+
+    @field_validator("oidc_group_role_mappings")
+    @classmethod
+    def validate_oidc_group_role_mappings(cls, value: str) -> str:
+        try:
+            mappings = json.loads(value or "{}")
+        except json.JSONDecodeError as exc:
+            raise ValueError("DEPLOYFORGE_OIDC_GROUP_ROLE_MAPPINGS must be valid JSON") from exc
+        if not isinstance(mappings, dict):
+            raise ValueError("OIDC group-role mappings must be a JSON object")
+        roles = {"workspace_admin", "platform_engineer", "service_owner", "auditor"}
+        slug_pattern = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,78}[a-z0-9])?\Z")
+        seen: set[str] = set()
+        for group, workspace_roles in mappings.items():
+            if not isinstance(group, str) or not group.strip() or len(group.strip()) > 180:
+                raise ValueError("OIDC group names must contain 1 to 180 characters")
+            group_key = group.strip().casefold()
+            if group_key in seen:
+                raise ValueError("OIDC group names must be unique without regard to case")
+            seen.add(group_key)
+            if not isinstance(workspace_roles, dict) or not workspace_roles:
+                raise ValueError("Each OIDC group must map to one or more workspace roles")
+            for slug, role in workspace_roles.items():
+                if not isinstance(slug, str) or not slug_pattern.fullmatch(slug):
+                    raise ValueError("OIDC group mappings require valid workspace slugs")
+                if not isinstance(role, str) or role not in roles:
+                    raise ValueError("OIDC group mappings contain an unsupported workspace role")
+        return json.dumps(mappings, sort_keys=True)
 
     @field_validator("session_cookie_name")
     @classmethod
@@ -439,6 +478,14 @@ class Settings(BaseSettings):
     def oidc_admin_email_set(self) -> set[str]:
         return {
             email.strip().casefold() for email in self.oidc_admin_emails.split(",") if email.strip()
+        }
+
+    @property
+    def oidc_group_role_map(self) -> dict[str, dict[str, str]]:
+        mappings = json.loads(self.oidc_group_role_mappings or "{}")
+        return {
+            group.strip().casefold(): {slug: role for slug, role in workspace_roles.items()}
+            for group, workspace_roles in mappings.items()
         }
 
     @property

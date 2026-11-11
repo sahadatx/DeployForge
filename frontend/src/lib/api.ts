@@ -193,6 +193,8 @@ export type User = {
 export type WorkspaceMembership = {
   workspace_id: string;
   role: "workspace_admin" | "platform_engineer" | "service_owner" | "auditor" | "platform_admin";
+  identity_source: "manual" | "idp";
+  identity_groups: string[];
 };
 
 export type AuthSession = {
@@ -211,6 +213,8 @@ export type WorkspaceMember = {
   membership_id: string;
   user: User;
   role: "workspace_admin" | "platform_engineer" | "service_owner" | "auditor";
+  identity_source: "manual" | "idp";
+  identity_groups: string[];
   created_at: string;
 };
 

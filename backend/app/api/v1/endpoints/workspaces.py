@@ -289,6 +289,8 @@ def list_members(
             "membership_id": membership.id,
             "user": membership.user,
             "role": membership.role,
+            "identity_source": membership.identity_source,
+            "identity_groups": membership.identity_groups or [],
             "created_at": membership.created_at,
         }
         for membership in memberships
@@ -364,6 +366,8 @@ def create_member(
         "membership_id": membership.id,
         "user": user,
         "role": membership.role,
+        "identity_source": membership.identity_source,
+        "identity_groups": membership.identity_groups or [],
         "created_at": membership.created_at,
     }
 
@@ -408,6 +412,11 @@ def update_member(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Workspace member not found"
         )
+    if membership.identity_source == "idp":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This workspace role is managed by the identity provider",
+        )
     if membership.role == "workspace_admin" and payload.role != "workspace_admin":
         admin_count = (
             db.scalar(
@@ -446,6 +455,8 @@ def update_member(
         "membership_id": membership.id,
         "user": membership.user,
         "role": membership.role,
+        "identity_source": membership.identity_source,
+        "identity_groups": membership.identity_groups or [],
         "created_at": membership.created_at,
     }
 
@@ -472,6 +483,11 @@ def delete_member(
     if membership is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Workspace member not found"
+        )
+    if membership.identity_source == "idp":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This workspace role is managed by the identity provider",
         )
     if membership.role == "workspace_admin":
         admin_count = (

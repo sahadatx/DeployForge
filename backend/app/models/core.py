@@ -97,6 +97,12 @@ class WorkspaceMembership(Base):
         Uuid, ForeignKey("users.id", ondelete="CASCADE"), nullable=False
     )
     role: Mapped[str] = mapped_column(String(40), nullable=False)
+    identity_source: Mapped[str] = mapped_column(
+        String(40), default="manual", server_default=text("'manual'"), nullable=False
+    )
+    identity_groups: Mapped[list] = mapped_column(
+        JSON, default=list, server_default=text("'[]'"), nullable=False
+    )
     granted_by: Mapped[uuid.UUID | None] = mapped_column(
         Uuid, ForeignKey("users.id", ondelete="SET NULL")
     )

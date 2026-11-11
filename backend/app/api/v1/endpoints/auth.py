@@ -1,6 +1,7 @@
 import logging
 import secrets
 from datetime import UTC, datetime, timedelta
+from typing import Any
 from urllib.parse import urljoin
 
 from authlib.integrations.base_client.errors import OAuthError
@@ -14,6 +15,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_current_identity, get_db, hash_session_token, require_csrf
 from app.core.audit import record_audit
 from app.core.config import settings
+from app.core.oidc_group_sync import sync_oidc_group_memberships
 from app.models import User, UserSession, WorkspaceMembership
 from app.schemas.core import AuthSessionContract, UserContract
 
@@ -81,7 +83,7 @@ def _frontend_redirect(path: str) -> RedirectResponse:
     )
 
 
-def _membership_payload(db: Session, user: User) -> list[dict[str, str]]:
+def _membership_payload(db: Session, user: User) -> list[dict[str, Any]]:
     memberships = db.scalars(
         select(WorkspaceMembership)
         .where(WorkspaceMembership.user_id == user.id)
@@ -91,6 +93,8 @@ def _membership_payload(db: Session, user: User) -> list[dict[str, str]]:
         {
             "workspace_id": str(membership.workspace_id),
             "role": membership.role,
+            "identity_source": membership.identity_source,
+            "identity_groups": membership.identity_groups or [],
         }
         for membership in memberships
     ]
@@ -143,6 +147,17 @@ async def oidc_callback(request: Request, db: Session = Depends(get_db)):
         issuer = str(claims.get("iss", "")).strip()
         email = str(claims.get("email", "")).strip().casefold()
         email_verified = claims.get("email_verified") is True
+        group_claim = claims.get(settings.oidc_group_claim)
+        if group_claim is None:
+            if settings.oidc_group_role_map:
+                raise ValueError("Configured OIDC group claim was not returned")
+            group_names: list[str] = []
+        elif not isinstance(group_claim, list) or any(
+            not isinstance(group, str) or len(group) > 180 for group in group_claim
+        ):
+            raise ValueError("OIDC group claim must be a list of group names")
+        else:
+            group_names = group_claim
         if not subject or not issuer or not email or not email_verified:
             raise ValueError("OIDC identity is missing verified account claims")
 
@@ -199,11 +214,13 @@ async def oidc_callback(request: Request, db: Session = Depends(get_db)):
             db.commit()
             return _frontend_redirect("/login?error=account_disabled")
 
+        sync_oidc_group_memberships(db, user, group_names)
         raw_token, _session = _finish_login(db, user, method="oidc")
         response = _frontend_redirect("/overview")
         _set_session_cookie(response, raw_token)
         return response
     except (OAuthError, ValueError, KeyError) as exc:
+        db.rollback()
         logger.info("oidc_authentication_rejected", extra={"reason": type(exc).__name__})
         record_audit(
             db,
