@@ -3,7 +3,8 @@
 The Helm chart can run an isolated Kubernetes `CronJob` to create an encrypted
 PostgreSQL custom-format dump and store it in an S3-compatible bucket. Backups
 are disabled by default. This job does not provide point-in-time recovery or a
-restore drill; those are separate operational work.
+restore drill by itself. Follow the [PostgreSQL PITR and recovery-drill
+runbook](postgres-recovery-drills.md) to configure and exercise recovery.
 
 ## Prerequisites
 
