@@ -1,0 +1,8 @@
+**
+!deploy/
+!deploy/backup/
+!deploy/backup/Dockerfile
+!scripts/
+!scripts/backup-postgres-offsite.sh
+!scripts/lib/
+!scripts/lib/postgres-url-to-env.py

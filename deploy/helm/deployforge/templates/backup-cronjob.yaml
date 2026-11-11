@@ -1,0 +1,93 @@
+{{- if .Values.backup.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "deployforge.fullname" . }}-postgres-backup
+  labels:
+    {{- include "deployforge.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres-backup
+spec:
+  schedule: {{ .Values.backup.schedule | quote }}
+  timeZone: {{ .Values.backup.timeZone | quote }}
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 900
+  successfulJobsHistoryLimit: {{ .Values.backup.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.backup.failedJobsHistoryLimit }}
+  jobTemplate:
+    spec:
+      backoffLimit: 3
+      activeDeadlineSeconds: 7200
+      ttlSecondsAfterFinished: 86400
+      template:
+        metadata:
+          labels:
+            {{- include "deployforge.selectorLabels" . | nindent 12 }}
+            app.kubernetes.io/component: postgres-backup
+        spec:
+          restartPolicy: Never
+          serviceAccountName: {{ default (printf "%s-backup" (include "deployforge.fullname" .)) .Values.backup.serviceAccount.name }}
+          automountServiceAccountToken: true
+          {{- include "deployforge.imagePullSecrets" . | nindent 10 }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 70
+            runAsGroup: 70
+            fsGroup: 70
+            fsGroupChangePolicy: OnRootMismatch
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: backup
+              image: "{{- if .Values.backup.image.digest }}{{ .Values.backup.image.repository }}@{{ .Values.backup.image.digest }}{{- else }}{{ .Values.backup.image.repository }}:{{ .Values.backup.image.tag }}{{- end }}"
+              imagePullPolicy: {{ .Values.backup.image.pullPolicy }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              env:
+                - name: HOME
+                  value: /tmp
+                - name: DEPLOYFORGE_DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.database.existingSecret | quote }}
+                      key: {{ .Values.database.urlKey | quote }}
+                {{- if .Values.database.tls.enabled }}
+                - name: DEPLOYFORGE_DATABASE_SSLMODE
+                  value: {{ .Values.database.tls.sslMode | quote }}
+                - name: DEPLOYFORGE_DATABASE_SSLROOTCERT
+                  value: {{ printf "%s/ca.crt" (trimSuffix "/" .Values.database.tls.mountPath) | quote }}
+                {{- end }}
+                - name: AWS_REGION
+                  value: {{ .Values.backup.region | quote }}
+                - name: S3_BUCKET
+                  value: {{ required "backup.bucket is required when backup.enabled=true" .Values.backup.bucket | quote }}
+                - name: S3_PREFIX
+                  value: {{ .Values.backup.prefix | quote }}
+                - name: S3_ENDPOINT_URL
+                  value: {{ .Values.backup.endpointUrl | quote }}
+                - name: AGE_RECIPIENT
+                  value: {{ required "backup.ageRecipient is required when backup.enabled=true" .Values.backup.ageRecipient | quote }}
+                - name: S3_SSE_KMS_KEY_ID
+                  value: {{ .Values.backup.sseKmsKeyId | quote }}
+                - name: S3_OBJECT_LOCK_MODE
+                  value: {{ .Values.backup.objectLock.mode | quote }}
+                - name: S3_OBJECT_LOCK_RETENTION_DAYS
+                  value: {{ .Values.backup.objectLock.retentionDays | quote }}
+              resources:
+                {{- toYaml .Values.backup.resources | nindent 16 }}
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+                {{- if .Values.database.tls.enabled }}
+                {{- include "deployforge.databaseVolumeMounts" . | nindent 16 }}
+                {{- end }}
+          volumes:
+            - name: tmp
+              emptyDir:
+                sizeLimit: {{ .Values.backup.temporaryStorageLimit | quote }}
+            {{- if .Values.database.tls.enabled }}
+            {{- include "deployforge.databaseVolumes" . | nindent 12 }}
+            {{- end }}
+{{- end }}
