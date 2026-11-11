@@ -35,7 +35,11 @@ def do_run_migrations(connection: Connection) -> None:
 
 
 def run_migrations_online() -> None:
-    connectable = create_engine(settings.database_url, poolclass=pool.NullPool)
+    connectable = create_engine(
+        settings.database_url,
+        connect_args=settings.database_connect_args,
+        poolclass=pool.NullPool,
+    )
     with connectable.connect() as connection:
         do_run_migrations(connection)
     connectable.dispose()

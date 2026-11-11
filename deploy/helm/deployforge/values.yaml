@@ -53,6 +53,16 @@ database:
   # Supply a managed PostgreSQL URL through the cluster secret manager.
   existingSecret: deployforge-runtime
   urlKey: database_url
+  pool:
+    size: 3
+    maxOverflow: 2
+    timeoutSeconds: 30
+    recycleSeconds: 1800
+  tls:
+    enabled: true
+    sslMode: verify-full
+    rootCertKey: database_ca.crt
+    mountPath: /run/secrets/postgres-ca
 
 secrets:
   existingSecret: deployforge-runtime

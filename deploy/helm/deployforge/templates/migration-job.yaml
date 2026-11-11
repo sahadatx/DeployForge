@@ -54,7 +54,13 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            {{- if .Values.database.tls.enabled }}
+            {{- include "deployforge.databaseVolumeMounts" . | nindent 12 }}
+            {{- end }}
       volumes:
         - name: tmp
           emptyDir:
             sizeLimit: 64Mi
+        {{- if .Values.database.tls.enabled }}
+        {{- include "deployforge.databaseVolumes" . | nindent 8 }}
+        {{- end }}

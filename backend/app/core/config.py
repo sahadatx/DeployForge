@@ -2,9 +2,9 @@ import os
 import re
 from functools import lru_cache
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
-from pydantic import SecretStr, field_validator, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -27,6 +27,13 @@ class Settings(BaseSettings):
     runtime_role: str = "api"
     log_level: str = "INFO"
     database_url: str = "sqlite:///./deployforge.db"
+    database_pool_size: int = Field(default=3, ge=1, le=100)
+    database_max_overflow: int = Field(default=2, ge=0, le=100)
+    database_pool_timeout_seconds: int = Field(default=30, ge=1, le=300)
+    database_pool_recycle_seconds: int = Field(default=1800, ge=60, le=86400)
+    database_require_ssl: bool = False
+    database_sslmode: str = ""
+    database_sslrootcert: str = ""
     worker_heartbeat_interval_seconds: int = 10
     worker_heartbeat_stale_after_seconds: int = 30
     telemetry_retention_days: int = 31
@@ -127,6 +134,39 @@ class Settings(BaseSettings):
         if not value:
             raise ValueError("DEPLOYFORGE_DATABASE_URL cannot be empty")
         return value
+
+    @field_validator("database_sslmode", mode="before")
+    @classmethod
+    def normalize_database_sslmode(cls, value: str) -> str:
+        normalized = str(value or "").strip().lower()
+        supported = {
+            "",
+            "disable",
+            "allow",
+            "prefer",
+            "require",
+            "verify-ca",
+            "verify-full",
+        }
+        if normalized not in supported:
+            raise ValueError(
+                "DEPLOYFORGE_DATABASE_SSLMODE must be a supported PostgreSQL sslmode"
+            )
+        return normalized
+
+    @field_validator("database_sslrootcert", mode="before")
+    @classmethod
+    def normalize_database_sslrootcert(cls, value: str) -> str:
+        return str(value or "").strip()
+
+    @property
+    def database_connect_args(self) -> dict[str, str]:
+        args: dict[str, str] = {}
+        if self.database_sslmode:
+            args["sslmode"] = self.database_sslmode
+        if self.database_sslrootcert:
+            args["sslrootcert"] = self.database_sslrootcert
+        return args
 
     @field_validator("session_secret", "oidc_client_secret", mode="before")
     @classmethod
@@ -332,6 +372,23 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "Production requires a PostgreSQL DEPLOYFORGE_DATABASE_URL using "
                     "the psycopg driver"
+                )
+        if self.database_require_ssl:
+            url_query = parse_qs(urlsplit(self.database_url).query)
+            sslmode = self.database_sslmode or next(
+                iter(url_query.get("sslmode", [])), ""
+            )
+            if sslmode not in {"require", "verify-ca", "verify-full"}:
+                raise ValueError(
+                    "DEPLOYFORGE_DATABASE_REQUIRE_SSL requires sslmode=require, "
+                    "verify-ca, or verify-full"
+                )
+            root_cert = self.database_sslrootcert or next(
+                iter(url_query.get("sslrootcert", [])), ""
+            )
+            if sslmode in {"verify-ca", "verify-full"} and not root_cert:
+                raise ValueError(
+                    "DEPLOYFORGE_DATABASE_SSLROOTCERT is required for verified PostgreSQL TLS"
                 )
 
         if is_production and self.runtime_role == "api":

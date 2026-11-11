@@ -116,6 +116,14 @@ spec:
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
+          {{- if .Values.database.tls.enabled }}
+          volumeMounts:
+            {{- include "deployforge.databaseVolumeMounts" . | nindent 12 }}
+          {{- end }}
+      {{- if .Values.database.tls.enabled }}
+      volumes:
+        {{- include "deployforge.databaseVolumes" . | nindent 8 }}
+      {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
