@@ -69,6 +69,7 @@ secrets:
   keys:
     sessionSecret: session_secret
     oidcClientSecret: oidc_client_secret
+    scimBearerToken: scim_bearer_token
     buildCallbackSecret: build_callback_secret
     githubActionsToken: github_actions_token
     argocdAuthToken: argocd_auth_token
@@ -83,8 +84,11 @@ config:
     discoveryUrl: https://identity.example.com/.well-known/openid-configuration
     clientId: deployforge
     redirectUri: https://deployforge.example.com/api/v1/auth/callback
+    scimExternalIdClaim: employeeNumber
     groupClaim: groups
     groupRoleMappings: "{}"
+  scim:
+    enabled: false
   github:
     enabled: false
     apiUrl: https://api.github.com

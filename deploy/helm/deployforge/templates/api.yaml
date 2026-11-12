@@ -105,10 +105,19 @@ spec:
                   key: {{ .Values.secrets.keys.oidcClientSecret | quote }}
             - name: DEPLOYFORGE_OIDC_REDIRECT_URI
               value: {{ .Values.config.oidc.redirectUri | quote }}
+            - name: DEPLOYFORGE_OIDC_SCIM_EXTERNAL_ID_CLAIM
+              value: {{ .Values.config.oidc.scimExternalIdClaim | quote }}
             - name: DEPLOYFORGE_OIDC_GROUP_CLAIM
               value: {{ .Values.config.oidc.groupClaim | quote }}
             - name: DEPLOYFORGE_OIDC_GROUP_ROLE_MAPPINGS
               value: {{ .Values.config.oidc.groupRoleMappings | quote }}
+            {{- if .Values.config.scim.enabled }}
+            - name: DEPLOYFORGE_SCIM_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.existingSecret | quote }}
+                  key: {{ .Values.secrets.keys.scimBearerToken | quote }}
+            {{- end }}
             - name: DEPLOYFORGE_FRONTEND_BASE_URL
               value: {{ .Values.config.frontendBaseUrl | quote }}
             - name: DEPLOYFORGE_BUILD_CALLBACK_SECRET

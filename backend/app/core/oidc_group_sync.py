@@ -1,5 +1,7 @@
 """Synchronize OIDC group claims into workspace-scoped memberships."""
 
+from typing import Literal
+
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -15,7 +17,13 @@ ROLE_PRIORITY = {
 }
 
 
-def sync_oidc_group_memberships(db: Session, user: User, group_names: list[str]) -> None:
+def sync_oidc_group_memberships(
+    db: Session,
+    user: User,
+    group_names: list[str],
+    *,
+    identity_source: Literal["idp", "scim"] = "idp",
+) -> None:
     """Apply mapped roles, retaining manual memberships and revoking stale IdP grants."""
     mappings = settings.oidc_group_role_map
     normalized_by_key: dict[str, str] = {}
@@ -50,7 +58,7 @@ def sync_oidc_group_memberships(db: Session, user: User, group_names: list[str])
         for membership in db.scalars(
             select(WorkspaceMembership).where(
                 WorkspaceMembership.user_id == user.id,
-                WorkspaceMembership.identity_source == "idp",
+                WorkspaceMembership.identity_source == identity_source,
             )
         ).all()
     }
@@ -66,7 +74,7 @@ def sync_oidc_group_memberships(db: Session, user: User, group_names: list[str])
             resource_type="workspace_membership",
             resource_id=membership.id,
             workspace_id=workspace_id,
-            details={"identity_source": "idp", "previous_role": membership.role},
+            details={"identity_source": identity_source, "previous_role": membership.role},
         )
         db.delete(membership)
 
@@ -76,7 +84,7 @@ def sync_oidc_group_memberships(db: Session, user: User, group_names: list[str])
             select(WorkspaceMembership).where(
                 WorkspaceMembership.workspace_id == workspace.id,
                 WorkspaceMembership.user_id == user.id,
-                WorkspaceMembership.identity_source != "idp",
+                WorkspaceMembership.identity_source != identity_source,
             )
         )
         if manual is not None:
@@ -90,7 +98,7 @@ def sync_oidc_group_memberships(db: Session, user: User, group_names: list[str])
                 workspace_id=workspace.id,
                 user_id=user.id,
                 role=role,
-                identity_source="idp",
+                identity_source=identity_source,
                 identity_groups=groups,
             )
             db.add(membership)
@@ -102,7 +110,7 @@ def sync_oidc_group_memberships(db: Session, user: User, group_names: list[str])
                 resource_type="workspace_membership",
                 resource_id=membership.id,
                 workspace_id=workspace.id,
-                details={"identity_source": "idp", "role": role, "groups": groups},
+                details={"identity_source": identity_source, "role": role, "groups": groups},
             )
         elif membership.role != role or sorted(membership.identity_groups or []) != groups:
             previous_role = membership.role
@@ -116,7 +124,7 @@ def sync_oidc_group_memberships(db: Session, user: User, group_names: list[str])
                 resource_id=membership.id,
                 workspace_id=workspace.id,
                 details={
-                    "identity_source": "idp",
+                    "identity_source": identity_source,
                     "previous_role": previous_role,
                     "role": role,
                     "groups": groups,

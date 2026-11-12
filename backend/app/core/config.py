@@ -62,6 +62,8 @@ class Settings(BaseSettings):
     oidc_client_secret: SecretStr | None = None
     oidc_redirect_uri: str = ""
     oidc_admin_emails: str = ""
+    oidc_scim_external_id_claim: str = "external_id"
+    scim_bearer_token: SecretStr | None = None
     oidc_group_claim: str = "groups"
     oidc_group_role_mappings: str = "{}"
     frontend_base_url: str = "http://localhost:5173"
@@ -82,6 +84,7 @@ class Settings(BaseSettings):
             "argocd_auth_token",
             "session_secret",
             "oidc_client_secret",
+            "scim_bearer_token",
         ):
             file_environment_name = f"DEPLOYFORGE_{field_name.upper()}_FILE"
             secret_file = os.environ.get(file_environment_name)
@@ -181,12 +184,12 @@ class Settings(BaseSettings):
         normalized = str(value).strip()
         return normalized or None
 
-    @field_validator("oidc_group_claim")
+    @field_validator("oidc_group_claim", "oidc_scim_external_id_claim")
     @classmethod
-    def validate_oidc_group_claim(cls, value: str) -> str:
+    def validate_oidc_claim_names(cls, value: str) -> str:
         normalized = value.strip()
         if not normalized or len(normalized) > 255:
-            raise ValueError("DEPLOYFORGE_OIDC_GROUP_CLAIM must contain 1 to 255 characters")
+            raise ValueError("OIDC claim names must contain between 1 and 255 characters")
         return normalized
 
     @field_validator("oidc_group_role_mappings")
@@ -230,6 +233,7 @@ class Settings(BaseSettings):
         "argocd_auth_token",
         "session_secret",
         "oidc_client_secret",
+        "scim_bearer_token",
         mode="before",
     )
     @classmethod
@@ -286,6 +290,8 @@ class Settings(BaseSettings):
             raise ValueError(
                 "DEPLOYFORGE_BUILD_CALLBACK_SECRET must contain at least 32 characters"
             )
+        if self.scim_bearer_token and len(self.scim_bearer_token.get_secret_value()) < 32:
+            raise ValueError("DEPLOYFORGE_SCIM_BEARER_TOKEN must contain at least 32 characters")
         parsed_github_api_url = urlsplit(self.github_api_url.strip())
         if (
             parsed_github_api_url.scheme != "https"

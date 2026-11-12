@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.sessions import SessionMiddleware
 
+from app.api.v1.endpoints import scim
 from app.api.v1.router import api_router
 from app.core.config import settings
 from app.core.logging import configure_logging
@@ -146,3 +147,4 @@ def root() -> dict[str, str]:
 
 
 app.include_router(api_router, prefix="/api/v1")
+app.include_router(scim.router, prefix="/scim/v2")

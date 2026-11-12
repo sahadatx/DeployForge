@@ -54,6 +54,7 @@ class User(Base):
     __table_args__ = (
         UniqueConstraint("issuer", "subject", name="uq_users_issuer_subject"),
         UniqueConstraint("email", name="uq_users_email"),
+        UniqueConstraint("scim_external_id", name="uq_users_scim_external_id"),
         Index("ix_users_active_email", "active", "email"),
     )
 
@@ -63,6 +64,7 @@ class User(Base):
     email: Mapped[str] = mapped_column(String(320), nullable=False)
     display_name: Mapped[str] = mapped_column(String(180), nullable=False)
     email_verified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    scim_external_id: Mapped[str | None] = mapped_column(String(255))
     is_platform_admin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
@@ -80,6 +82,49 @@ class User(Base):
     sessions: Mapped[list["UserSession"]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
+    scim_group_memberships: Mapped[list["SCIMGroupMembership"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+
+
+class SCIMGroup(Base):
+    __tablename__ = "scim_groups"
+    __table_args__ = (
+        UniqueConstraint("display_name", name="uq_scim_groups_display_name"),
+        UniqueConstraint("external_id", name="uq_scim_groups_external_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    external_id: Mapped[str | None] = mapped_column(String(255))
+    display_name: Mapped[str] = mapped_column(String(180), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+    memberships: Mapped[list["SCIMGroupMembership"]] = relationship(
+        back_populates="group", cascade="all, delete-orphan"
+    )
+
+
+class SCIMGroupMembership(Base):
+    __tablename__ = "scim_group_memberships"
+    __table_args__ = (Index("ix_scim_group_memberships_user_id", "user_id"),)
+
+    group_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("scim_groups.id", ondelete="CASCADE"), primary_key=True
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+
+    group: Mapped[SCIMGroup] = relationship(back_populates="memberships")
+    user: Mapped[User] = relationship(back_populates="scim_group_memberships")
 
 
 class WorkspaceMembership(Base):

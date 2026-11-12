@@ -147,10 +147,18 @@ async def oidc_callback(request: Request, db: Session = Depends(get_db)):
         issuer = str(claims.get("iss", "")).strip()
         email = str(claims.get("email", "")).strip().casefold()
         email_verified = claims.get("email_verified") is True
+        external_id_claim = claims.get(settings.oidc_scim_external_id_claim)
+        if external_id_claim is not None and not isinstance(external_id_claim, str):
+            raise ValueError("OIDC SCIM external ID claim must be a string")
+        scim_external_id = (external_id_claim or "").strip()
+        if len(scim_external_id) > 255:
+            raise ValueError("OIDC SCIM external ID claim exceeds 255 characters")
+
+        group_claim_present = settings.oidc_group_claim in claims
         group_claim = claims.get(settings.oidc_group_claim)
+        if group_claim is None and group_claim_present:
+            raise ValueError("OIDC group claim must be a list of group names")
         if group_claim is None:
-            if settings.oidc_group_role_map:
-                raise ValueError("Configured OIDC group claim was not returned")
             group_names: list[str] = []
         elif not isinstance(group_claim, list) or any(
             not isinstance(group, str) or len(group) > 180 for group in group_claim
@@ -162,6 +170,28 @@ async def oidc_callback(request: Request, db: Session = Depends(get_db)):
             raise ValueError("OIDC identity is missing verified account claims")
 
         user = db.scalar(select(User).where(User.issuer == issuer, User.subject == subject))
+        if user is None and scim_external_id:
+            user = db.scalar(select(User).where(User.scim_external_id == scim_external_id))
+            if user is not None and user.active:
+                conflicting_email = db.scalar(
+                    select(User).where(func.lower(User.email) == email, User.id != user.id)
+                )
+                if conflicting_email is not None:
+                    raise ValueError("SCIM identity email conflicts with another account")
+                user.issuer = issuer
+                user.subject = subject
+                user.email = email
+                user.display_name = str(claims.get("name") or user.display_name)[:180]
+                user.email_verified = True
+                record_audit(
+                    db,
+                    actor=user,
+                    action="identity.scim_account.linked",
+                    resource_type="user",
+                    resource_id=user.id,
+                    details={"method": "verified_oidc_external_id"},
+                )
+
         if user is None:
             email_owner = db.scalar(select(User).where(func.lower(User.email) == email))
             if email_owner is not None:
@@ -194,7 +224,7 @@ async def oidc_callback(request: Request, db: Session = Depends(get_db)):
                     resource_id=user.id,
                     details={"method": "verified_oidc_email_allowlist"},
                 )
-        else:
+        elif user.active:
             user.email = email
             user.display_name = str(claims.get("name") or user.display_name)[:180]
             user.email_verified = True
@@ -214,6 +244,8 @@ async def oidc_callback(request: Request, db: Session = Depends(get_db)):
             db.commit()
             return _frontend_redirect("/login?error=account_disabled")
 
+        if not group_claim_present and settings.oidc_group_role_map and not user.scim_external_id:
+            raise ValueError("Configured OIDC group claim was not returned")
         sync_oidc_group_memberships(db, user, group_names)
         raw_token, _session = _finish_login(db, user, method="oidc")
         response = _frontend_redirect("/overview")

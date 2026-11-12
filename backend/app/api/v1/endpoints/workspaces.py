@@ -412,7 +412,7 @@ def update_member(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Workspace member not found"
         )
-    if membership.identity_source == "idp":
+    if membership.identity_source in {"idp", "scim"}:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="This workspace role is managed by the identity provider",
@@ -484,7 +484,7 @@ def delete_member(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Workspace member not found"
         )
-    if membership.identity_source == "idp":
+    if membership.identity_source in {"idp", "scim"}:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="This workspace role is managed by the identity provider",
