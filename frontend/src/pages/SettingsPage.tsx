@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { BookOpen, Building2, CircleUserRound, KeyRound, Plus, ShieldCheck, Trash2, UsersRound } from "lucide-react";
 import { PageFrame } from "../components/PageFrame";
+import { FieldLabel, FormDrawer } from "../components/FormDrawer";
 import { apiDelete, apiGet, apiPatch, apiPost, type AuthConfig, type AuthSession, type Workspace, type WorkspaceMember } from "../lib/api";
 
 const roles = ["workspace_admin", "platform_engineer", "service_owner", "auditor"] as const;
@@ -16,11 +17,16 @@ export default function SettingsPage() {
   const [workspaceSlug, setWorkspaceSlug] = useState("");
   const [memberEmail, setMemberEmail] = useState("");
   const [memberRole, setMemberRole] = useState<Role>("platform_engineer");
+  const [reviewMemberId, setReviewMemberId] = useState("");
+  const [reviewDecision, setReviewDecision] = useState<"retain" | "revoke">("retain");
+  const [reviewComment, setReviewComment] = useState("");
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [compactDensity, setCompactDensity] = useState(() => localStorage.getItem("deployforge.density") === "compact");
   const [timeZone, setTimeZone] = useState(() => localStorage.getItem("deployforge.timezone") || "system");
+
+  useEffect(() => { setReviewMemberId(""); setReviewComment(""); }, [workspaceId]);
 
   useEffect(() => {
     localStorage.setItem("deployforge.density", compactDensity ? "compact" : "comfortable");
@@ -137,9 +143,36 @@ export default function SettingsPage() {
     }
   }
 
+  async function reviewAccess(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!workspaceId || !reviewMember || busy) return;
+    setBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      const result = await apiPost<{ status: string }>(
+        `/workspaces/${workspaceId}/members/${reviewMember.user.id}/review`,
+        { decision: reviewDecision, comment: reviewComment.trim() },
+      );
+      setReviewMemberId("");
+      setReviewComment("");
+      setNotice(result.status === "pending_external"
+        ? `Review recorded. Remove ${reviewMember.user.display_name} from the mapped identity group to complete revocation.`
+        : reviewDecision === "retain"
+          ? `Access retained for ${reviewMember.user.display_name}.`
+          : `Access revoked for ${reviewMember.user.display_name}.`);
+      await loadSettings();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not record the access review.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   const isPlatformAdmin = Boolean(session?.user.is_platform_admin);
   const selectedRole = session?.memberships.find((membership) => membership.workspace_id === workspaceId)?.role;
   const canManageWorkspace = isPlatformAdmin || selectedRole === "workspace_admin";
+  const reviewMember = members.find((member) => member.membership_id === reviewMemberId);
   const showCreateWorkspace = isPlatformAdmin && (!workspaceId || !workspace);
 
   return (
@@ -183,7 +216,7 @@ export default function SettingsPage() {
             <p className="settings-footnote"><KeyRound size={13} /> Users must complete sign-in before they can be added. Workspace administrators can manage access; only platform administrators can grant that role.</p>
             <div className="member-table-wrap">
               <table className="member-table"><thead><tr><th>Member</th><th>Role</th><th>Access source</th><th>Access since</th><th><span className="sr-only">Actions</span></th></tr></thead>
-                <tbody>{members.map((member) => <tr key={member.membership_id}><td><div className="member-identity"><span className="member-avatar">{member.user.display_name.slice(0, 1).toUpperCase()}</span><span><strong>{member.user.display_name}</strong><small>{member.user.email}</small></span></div></td><td><select aria-label={`Role for ${member.user.email}`} disabled={busy || member.identity_source !== "manual" || (!isPlatformAdmin && member.role === "workspace_admin")} value={member.role} onChange={(event) => void changeRole(member, event.target.value as Role)}>{roles.filter((role) => role !== "workspace_admin" || isPlatformAdmin || member.role === role).map((role) => <option key={role} value={role}>{role.replaceAll("_", " ")}</option>)}</select></td><td>{member.identity_source === "idp" ? <span title={member.identity_groups.join(", ")}>Identity provider{member.identity_groups.length ? ` · ${member.identity_groups.slice(0, 2).join(", ")}${member.identity_groups.length > 2 ? ` +${member.identity_groups.length - 2}` : ""}` : ""}</span> : member.identity_source === "scim" ? <span title={member.identity_groups.join(", ")}>SCIM provisioning{member.identity_groups.length ? ` · ${member.identity_groups.slice(0, 2).join(", ")}${member.identity_groups.length > 2 ? ` +${member.identity_groups.length - 2}` : ""}` : ""}</span> : "Manual"}</td><td>{new Intl.DateTimeFormat(undefined, { dateStyle: "medium" }).format(new Date(member.created_at))}</td><td className="member-actions"><button className="icon-button danger-icon" disabled={busy || member.identity_source !== "manual"} onClick={() => void revokeAccess(member)} aria-label={`Revoke ${member.user.email}`} title={member.identity_source !== "manual" ? "Managed by the identity provider" : "Revoke workspace access"}><Trash2 size={15} /></button></td></tr>)}</tbody>
+                <tbody>{members.map((member) => <tr key={member.membership_id}><td><div className="member-identity"><span className="member-avatar">{member.user.display_name.slice(0, 1).toUpperCase()}</span><span><strong>{member.user.display_name}</strong><small>{member.user.email}</small></span></div></td><td><select aria-label={`Role for ${member.user.email}`} disabled={busy || member.identity_source !== "manual" || (!isPlatformAdmin && member.role === "workspace_admin")} value={member.role} onChange={(event) => void changeRole(member, event.target.value as Role)}>{roles.filter((role) => role !== "workspace_admin" || isPlatformAdmin || member.role === role).map((role) => <option key={role} value={role}>{role.replaceAll("_", " ")}</option>)}</select></td><td>{member.identity_source === "idp" ? <span title={member.identity_groups.join(", ")}>Identity provider{member.identity_groups.length ? ` · ${member.identity_groups.slice(0, 2).join(", ")}${member.identity_groups.length > 2 ? ` +${member.identity_groups.length - 2}` : ""}` : ""}</span> : member.identity_source === "scim" ? <span title={member.identity_groups.join(", ")}>SCIM provisioning{member.identity_groups.length ? ` · ${member.identity_groups.slice(0, 2).join(", ")}${member.identity_groups.length > 2 ? ` +${member.identity_groups.length - 2}` : ""}` : ""}</span> : "Manual"}</td><td>{new Intl.DateTimeFormat(undefined, { dateStyle: "medium" }).format(new Date(member.created_at))}</td><td className="member-actions"><button type="button" className="icon-button" disabled={busy || member.user.id === session?.user.id} onClick={() => { setReviewMemberId(member.membership_id); setReviewDecision("retain"); setReviewComment(""); setError(""); }} aria-label={`Review ${member.user.email} access`} title="Record an independent access review"><ShieldCheck size={15} /></button><button className="icon-button danger-icon" disabled={busy || member.identity_source !== "manual"} onClick={() => void revokeAccess(member)} aria-label={`Revoke ${member.user.email}`} title={member.identity_source !== "manual" ? "Managed by the identity provider" : "Revoke workspace access"}><Trash2 size={15} /></button></td></tr>)}</tbody>
               </table>
               {members.length === 0 && <div className="settings-empty">No workspace members are recorded yet.</div>}
             </div>
@@ -192,6 +225,15 @@ export default function SettingsPage() {
           <div className="settings-empty">{workspace ? "Workspace administrator permission is required to manage members." : "No workspace is selected."}</div>
         )}
       </section>
+
+      {reviewMember && workspace && canManageWorkspace && <FormDrawer title="Review workspace access" eyebrow="ACCESS GOVERNANCE" description="Record an independent retain or revoke decision. The decision and rationale are written to the audit log." busy={busy} error={error} dirty={Boolean(reviewComment || reviewDecision !== "retain")} onClose={() => { setReviewMemberId(""); setReviewComment(""); }} onReset={() => { setReviewDecision("retain"); setReviewComment(""); }} actions={<button form="workspace-access-review" type="submit" className="settings-primary-button" disabled={busy || reviewComment.trim().length < 3}><ShieldCheck size={15} /> Record review</button>}>
+        <form id="workspace-access-review" className="resource-form" onSubmit={reviewAccess}>
+          <div className="form-wide"><strong>{reviewMember.user.display_name}</strong><p className="form-note">{reviewMember.user.email} · {reviewMember.role.replaceAll("_", " ")} · {reviewMember.identity_source === "idp" ? "Identity provider" : reviewMember.identity_source === "scim" ? "SCIM provisioning" : "Manual access"}</p></div>
+          <label><FieldLabel required>Decision</FieldLabel><select value={reviewDecision} onChange={(event) => setReviewDecision(event.target.value as "retain" | "revoke")}><option value="retain">Retain access</option><option value="revoke">Revoke access</option></select></label>
+          <label className="form-wide"><FieldLabel required>Review rationale</FieldLabel><textarea required minLength={3} maxLength={500} value={reviewComment} onChange={(event) => setReviewComment(event.target.value)} placeholder="Why is this access still required, or why should it be removed?" /></label>
+          {reviewDecision === "revoke" && reviewMember.identity_source !== "manual" && <p className="form-note form-wide">This access is managed by an identity group. DeployForge records the review decision; remove the user from the mapped group in the identity provider to complete revocation.</p>}
+        </form>
+      </FormDrawer>}
 
       <section className="settings-panel settings-placeholder">
         <div className="settings-panel-heading"><div className="settings-panel-icon"><KeyRound size={17} /></div><div><h2>Authentication configuration</h2><p>Sign-in capability is read from the live API configuration. Provider secrets remain server-side.</p></div></div>

@@ -1237,6 +1237,13 @@ class MembershipUpdate(BaseModel):
     role: WorkspaceRole
 
 
+class MembershipReviewRequest(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    decision: Literal["retain", "revoke"]
+    comment: str = Field(min_length=3, max_length=500)
+
+
 class TelemetrySourceCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

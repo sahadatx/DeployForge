@@ -1,6 +1,7 @@
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import JSONResponse
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -14,6 +15,7 @@ from app.schemas.core import (
     EnvironmentCreate,
     EnvironmentPatch,
     MembershipCreate,
+    MembershipReviewRequest,
     MembershipUpdate,
     WorkspaceContract,
     WorkspaceCreate,
@@ -517,3 +519,102 @@ def delete_member(
     )
     db.delete(membership)
     db.commit()
+
+
+@router.post(
+    "/{workspace_id}/members/{user_id}/review",
+    summary="Record an independent workspace access review decision",
+)
+def review_member_access(
+    workspace_id: UUID,
+    user_id: UUID,
+    payload: MembershipReviewRequest,
+    identity: tuple[User, UserSession] = Depends(require_csrf),
+    db: Session = Depends(get_db),
+) -> dict:
+    reviewer = identity[0]
+    require_workspace_access(db, reviewer, workspace_id, roles={"workspace_admin"})
+    if reviewer.id == user_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="A member cannot approve their own access review",
+        )
+    membership = db.scalar(
+        select(WorkspaceMembership).where(
+            WorkspaceMembership.workspace_id == workspace_id,
+            WorkspaceMembership.user_id == user_id,
+        )
+    )
+    if membership is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Workspace member not found"
+        )
+
+    details = {
+        "target_user_id": str(user_id),
+        "decision": payload.decision,
+        "role": membership.role,
+        "identity_source": membership.identity_source,
+        "comment": payload.comment.strip() if payload.comment else None,
+    }
+    if payload.decision == "retain":
+        action = "identity.access_review.retained"
+        outcome = "succeeded"
+    elif membership.identity_source in {"idp", "scim"}:
+        record_audit(
+            db,
+            actor=reviewer,
+            action="identity.access_review.revocation_requested",
+            resource_type="workspace_membership",
+            resource_id=membership.id,
+            workspace_id=workspace_id,
+            outcome="pending_external",
+            details=details,
+        )
+        db.commit()
+        return JSONResponse(
+            status_code=status.HTTP_202_ACCEPTED,
+            content={
+                "membership_id": str(membership.id),
+                "decision": payload.decision,
+                "status": "pending_external",
+            },
+        )
+    else:
+        if membership.role == "workspace_admin":
+            admin_count = (
+                db.scalar(
+                    select(func.count())
+                    .select_from(WorkspaceMembership)
+                    .where(
+                        WorkspaceMembership.workspace_id == workspace_id,
+                        WorkspaceMembership.role == "workspace_admin",
+                    )
+                )
+                or 0
+            )
+            if admin_count <= 1:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="The last workspace administrator cannot be removed",
+                )
+        action = "identity.access_review.revoked"
+        outcome = "succeeded"
+        db.delete(membership)
+
+    record_audit(
+        db,
+        actor=reviewer,
+        action=action,
+        resource_type="workspace_membership",
+        resource_id=membership.id,
+        workspace_id=workspace_id,
+        outcome=outcome,
+        details=details,
+    )
+    db.commit()
+    return {
+        "membership_id": str(membership.id),
+        "decision": payload.decision,
+        "status": "completed",
+    }
