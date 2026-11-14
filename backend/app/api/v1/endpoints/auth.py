@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_current_identity, get_db, hash_session_token, require_csrf
 from app.core.audit import record_audit
 from app.core.config import settings
+from app.core.identity_admin import sync_oidc_admin_allowlist
 from app.core.oidc_group_sync import sync_oidc_group_memberships
 from app.models import User, UserSession, WorkspaceMembership
 from app.schemas.core import AuthSessionContract, UserContract
@@ -211,25 +212,13 @@ async def oidc_callback(request: Request, db: Session = Depends(get_db)):
                 email=email,
                 display_name=str(claims.get("name") or email.split("@", 1)[0])[:180],
                 email_verified=True,
-                is_platform_admin=email in settings.oidc_admin_email_set,
             )
             db.add(user)
             db.flush()
-            if user.is_platform_admin:
-                record_audit(
-                    db,
-                    actor=user,
-                    action="identity.platform_admin.bootstrapped",
-                    resource_type="user",
-                    resource_id=user.id,
-                    details={"method": "verified_oidc_email_allowlist"},
-                )
         elif user.active:
             user.email = email
             user.display_name = str(claims.get("name") or user.display_name)[:180]
             user.email_verified = True
-            if email in settings.oidc_admin_email_set:
-                user.is_platform_admin = True
 
         if not user.active:
             record_audit(
@@ -243,6 +232,8 @@ async def oidc_callback(request: Request, db: Session = Depends(get_db)):
             )
             db.commit()
             return _frontend_redirect("/login?error=account_disabled")
+
+        sync_oidc_admin_allowlist(db, user)
 
         if not group_claim_present and settings.oidc_group_role_map and not user.scim_external_id:
             raise ValueError("Configured OIDC group claim was not returned")

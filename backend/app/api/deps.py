@@ -7,6 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.core.identity_admin import sync_oidc_admin_allowlist
 from app.db.session import get_db
 from app.models import User, UserSession
 
@@ -49,9 +50,13 @@ def get_current_identity(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Account is unavailable"
         )
 
+    admin_access_changed = sync_oidc_admin_allowlist(db, user)
+
     # Limit last-seen writes so ordinary API reads do not all become database writes.
     if (now - last_seen_at) >= timedelta(minutes=5):
         session.last_seen_at = now
+        admin_access_changed = True
+    if admin_access_changed:
         db.commit()
     return user, session
 
