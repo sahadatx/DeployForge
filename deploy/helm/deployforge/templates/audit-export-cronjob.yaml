@@ -1,0 +1,86 @@
+{{- if .Values.auditExport.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "deployforge.fullname" . }}-audit-export
+  labels:
+    {{- include "deployforge.labels" . | nindent 4 }}
+    app.kubernetes.io/component: audit-export
+spec:
+  schedule: {{ .Values.auditExport.schedule | quote }}
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 300
+  successfulJobsHistoryLimit: {{ .Values.auditExport.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.auditExport.failedJobsHistoryLimit }}
+  jobTemplate:
+    spec:
+      backoffLimit: 3
+      activeDeadlineSeconds: 900
+      ttlSecondsAfterFinished: 86400
+      template:
+        metadata:
+          labels:
+            {{- include "deployforge.selectorLabels" . | nindent 12 }}
+            app.kubernetes.io/component: audit-export
+        spec:
+          restartPolicy: Never
+          serviceAccountName: {{ default (printf "%s-audit-export" (include "deployforge.fullname" .)) .Values.auditExport.serviceAccount.name }}
+          automountServiceAccountToken: true
+          {{- include "deployforge.imagePullSecrets" . | nindent 10 }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: exporter
+              image: "{{- if .Values.auditExport.image.digest }}{{ .Values.auditExport.image.repository }}@{{ .Values.auditExport.image.digest }}{{- else }}{{ .Values.auditExport.image.repository }}:{{ .Values.auditExport.image.tag }}{{- end }}"
+              imagePullPolicy: {{ .Values.auditExport.image.pullPolicy }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              env:
+                - name: DEPLOYFORGE_APP_ENV
+                  value: production
+                - name: DEPLOYFORGE_RUNTIME_ROLE
+                  value: worker
+                - name: DEPLOYFORGE_DATABASE_POOL_SIZE
+                  value: "2"
+                - name: DEPLOYFORGE_DATABASE_MAX_OVERFLOW
+                  value: "0"
+                - name: DEPLOYFORGE_FRONTEND_BASE_URL
+                  value: {{ .Values.config.frontendBaseUrl | quote }}
+                - name: DEPLOYFORGE_DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.database.existingSecret | quote }}
+                      key: {{ .Values.database.urlKey | quote }}
+                - name: AUDIT_EXPORT_BUCKET
+                  value: {{ required "auditExport.bucket is required when auditExport.enabled=true" .Values.auditExport.bucket | quote }}
+                - name: AUDIT_EXPORT_PREFIX
+                  value: {{ .Values.auditExport.prefix | quote }}
+                - name: AUDIT_EXPORT_REGION
+                  value: {{ .Values.auditExport.region | quote }}
+                - name: AUDIT_EXPORT_ENDPOINT_URL
+                  value: {{ .Values.auditExport.endpointUrl | quote }}
+                - name: AUDIT_EXPORT_KMS_KEY_ID
+                  value: {{ .Values.auditExport.kmsKeyId | quote }}
+                - name: AUDIT_EXPORT_OBJECT_LOCK_MODE
+                  value: {{ .Values.auditExport.objectLockMode | quote }}
+                - name: AUDIT_EXPORT_RETENTION_DAYS
+                  value: {{ .Values.auditExport.retentionDays | quote }}
+                - name: AUDIT_EXPORT_BATCH_SIZE
+                  value: {{ .Values.auditExport.batchSize | quote }}
+              resources:
+                {{- toYaml .Values.auditExport.resources | nindent 16 }}
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: tmp
+              emptyDir:
+                sizeLimit: 64Mi
+{{- end }}

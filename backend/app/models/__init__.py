@@ -1,5 +1,8 @@
 from app.models.core import (
     AuditEvent,
+    AuditExportBatch,
+    AuditExportBatchEvent,
+    AuditExportCursor,
     BuildArtifact,
     BuildRun,
     BuildRunEvent,
@@ -34,6 +37,9 @@ from app.models.core import (
 
 __all__ = [
     "AuditEvent",
+    "AuditExportBatch",
+    "AuditExportBatchEvent",
+    "AuditExportCursor",
     "BuildArtifact",
     "BuildRun",
     "BuildRunEvent",

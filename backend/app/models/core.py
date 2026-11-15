@@ -7,6 +7,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Index,
+    Integer,
     String,
     Text,
     UniqueConstraint,
@@ -926,6 +927,68 @@ class AuditEvent(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )
+
+
+class AuditExportCursor(Base):
+    __tablename__ = "audit_export_cursors"
+
+    export_name: Mapped[str] = mapped_column(String(100), primary_key=True)
+    cursor_created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cursor_event_id: Mapped[uuid.UUID | None] = mapped_column(Uuid)
+    chain_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    batch_sequence: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0"), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+
+class AuditExportBatch(Base):
+    """Durable reservation for an immutable audit export object pair."""
+
+    __tablename__ = "audit_export_batches"
+    __table_args__ = (
+        UniqueConstraint("export_name", "sequence", name="uq_audit_export_batches_sequence"),
+        Index("ix_audit_export_batches_status_sequence", "status", "sequence"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    export_name: Mapped[str] = mapped_column(
+        String(100),
+        ForeignKey("audit_export_cursors.export_name", ondelete="CASCADE"),
+        nullable=False,
+    )
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    object_stem: Mapped[str] = mapped_column(String(1024), nullable=False, unique=True)
+    event_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    previous_chain_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    final_chain_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    exported_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class AuditExportBatchEvent(Base):
+    """Exactly-once database reservation of an audit event for an export batch."""
+
+    __tablename__ = "audit_export_batch_events"
+    __table_args__ = (
+        UniqueConstraint("batch_id", "ordinal", name="uq_audit_export_batch_events_ordinal"),
+        Index("ix_audit_export_batch_events_batch_ordinal", "batch_id", "ordinal"),
+    )
+
+    event_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("audit_events.id", ondelete="RESTRICT"), primary_key=True
+    )
+    batch_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("audit_export_batches.id", ondelete="CASCADE"), nullable=False
+    )
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    record: Mapped[dict] = mapped_column(JSON, nullable=False)
 
 
 class WorkerHeartbeat(Base):
