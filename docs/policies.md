@@ -44,4 +44,4 @@ An exception must target a specific service and/or environment, include a reason
 
 Policy administration and exception review require a workspace admin or platform engineer. Evaluation results are visible to workspace members. Mutating browser requests require the session CSRF token.
 
-Artifact policy fields include values reported by the signed CI callback. In production, promotion also requires independent Sigstore artifact-signature and SLSA provenance verification; the API sets `all_signed` only after those checks pass. SBOM content and vulnerability counts remain producer-reported and are evaluated against the configured thresholds.
+Artifact policy fields include values reported by the signed CI callback. In production, promotion also requires independent Sigstore artifact-signature, SLSA provenance, and SBOM attestation verification; the API checks the SBOM predicate type, artifact subject digest, and canonical document digest before setting `all_signed`. Vulnerability counts remain producer-reported and are evaluated against the configured thresholds until scanner attestations are independently verified.

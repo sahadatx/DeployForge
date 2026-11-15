@@ -27,7 +27,7 @@ from app.schemas.core import BuildCallbackRequest, BuildRunContract, BuildRunDet
 
 router = APIRouter()
 BUILD_OPERATOR_ROLES = {"workspace_admin", "platform_engineer"}
-MAX_CALLBACK_BYTES = 256 * 1024
+MAX_CALLBACK_BYTES = 12 * 1024 * 1024
 
 
 def _load_build_run(

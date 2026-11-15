@@ -26,6 +26,8 @@ from app.schemas.core import BuildArtifactEvidence, BuildCallbackRequest
 GITHUB_ACTIONS_ISSUER = "https://token.actions.githubusercontent.com"
 SLSA_PROVENANCE_V1 = "https://slsa.dev/provenance/v1"
 IN_TOTO_STATEMENT_V1 = "https://in-toto.io/Statement/v1"
+CYCLONEDX_PREDICATE = "https://cyclonedx.org/bom"
+SPDX_PREDICATE = "https://spdx.dev/Document"
 
 
 class SupplyChainVerificationRejected(Exception):
@@ -175,8 +177,68 @@ def _verify_provenance_statement(
         )
 
 
+def _verified_statement(*, content_type: str, statement_bytes: bytes, label: str) -> dict:
+    if not content_type.startswith("application/vnd.in-toto+json"):
+        raise SupplyChainVerificationRejected(f"{label} payload is not an in-toto statement")
+    try:
+        statement = json.loads(statement_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SupplyChainVerificationRejected(f"{label} statement is not valid JSON") from exc
+    if not isinstance(statement, dict) or statement.get("_type") != IN_TOTO_STATEMENT_V1:
+        raise SupplyChainVerificationRejected(f"{label} must use in-toto Statement v1")
+    return statement
+
+
+def _statement_matches_artifact(statement: dict, evidence: BuildArtifactEvidence) -> bool:
+    expected_digest = evidence.digest.removeprefix("sha256:").casefold()
+    subjects = statement.get("subject")
+    return isinstance(subjects, list) and any(
+        isinstance(subject, dict)
+        and isinstance(subject.get("digest"), dict)
+        and str(subject["digest"].get("sha256", "")).casefold() == expected_digest
+        for subject in subjects
+    )
+
+
+def _canonical_json_digest(value: dict) -> str:
+    canonical = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return f"sha256:{hashlib.sha256(canonical).hexdigest()}"
+
+
+def _verify_sbom_statement(
+    *, content_type: str, statement_bytes: bytes, evidence: BuildArtifactEvidence
+) -> None:
+    statement = _verified_statement(
+        content_type=content_type, statement_bytes=statement_bytes, label="SBOM"
+    )
+    expected_predicate_type = (
+        CYCLONEDX_PREDICATE if evidence.sbom_format == "cyclonedx-json" else SPDX_PREDICATE
+    )
+    if statement.get("predicateType") != expected_predicate_type:
+        raise SupplyChainVerificationRejected(
+            "SBOM attestation predicate does not match its format"
+        )
+    if not _statement_matches_artifact(statement, evidence):
+        raise SupplyChainVerificationRejected(
+            "SBOM attestation does not identify the artifact digest"
+        )
+    predicate = statement.get("predicate")
+    if not isinstance(predicate, dict):
+        raise SupplyChainVerificationRejected("SBOM attestation has no document predicate")
+    if evidence.sbom_format == "cyclonedx-json" and predicate.get("bomFormat") != "CycloneDX":
+        raise SupplyChainVerificationRejected("attested SBOM is not a CycloneDX document")
+    if evidence.sbom_format == "spdx-json" and not str(predicate.get("spdxVersion", "")).startswith(
+        "SPDX-"
+    ):
+        raise SupplyChainVerificationRejected("attested SBOM is not an SPDX document")
+    if _canonical_json_digest(predicate) != evidence.sbom_digest:
+        raise SupplyChainVerificationRejected(
+            "attested SBOM content digest does not match its report"
+        )
+
+
 def verify_callback_evidence(payload: BuildCallbackRequest, build_run: BuildRun) -> None:
-    """Verify every reported artifact signature and its SLSA provenance bundle."""
+    """Verify artifact signatures, provenance, and attested SBOM contents."""
     if payload.status != "succeeded":
         return
     if not payload.artifacts:
@@ -201,6 +263,14 @@ def verify_callback_evidence(payload: BuildCallbackRequest, build_run: BuildRun)
                 evidence=evidence,
                 repository_url=build_run.repository_url or "",
                 commit_sha=payload.commit_sha,
+            )
+
+            sbom_bundle = _bundle(evidence.sbom_bundle, "SBOM attestation")
+            content_type, statement_bytes = verifier.verify_dsse(sbom_bundle, policy)
+            _verify_sbom_statement(
+                content_type=content_type,
+                statement_bytes=statement_bytes,
+                evidence=evidence,
             )
     except SupplyChainVerificationRejected:
         raise

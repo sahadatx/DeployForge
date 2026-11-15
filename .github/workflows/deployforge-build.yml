@@ -202,8 +202,10 @@ jobs:
           IMAGE: ${{ steps.source.outputs.image }}
           IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
           PROVENANCE_URI: ${{ steps.provenance.outputs.attestation-url }}
+          SBOM_URI: ${{ steps.sbom-attestation.outputs.attestation-url }}
           SIGNATURE_BUNDLE_PATH: image.sigstore.json
           PROVENANCE_BUNDLE_PATH: ${{ steps.provenance.outputs.bundle-path }}
+          SBOM_BUNDLE_PATH: ${{ steps.sbom-attestation.outputs.bundle-path }}
           SBOM_PATH: demo-service.cdx.json
           VULNERABILITY_REPORT_PATH: grype.json
           DEPLOYFORGE_CALLBACK_ALLOWED_HOST: ${{ vars.DEPLOYFORGE_CALLBACK_ALLOWED_HOST }}

@@ -51,6 +51,11 @@ def vulnerability_summary(path: str) -> dict[str, int]:
     return summary
 
 
+def canonical_json_digest(value: dict) -> str:
+    canonical = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return "sha256:" + hashlib.sha256(canonical).hexdigest()
+
+
 def build_payload() -> dict:
     status = os.environ.get("BUILD_STATUS", "failure").casefold()
     succeeded = status == "success"
@@ -98,7 +103,8 @@ def build_payload() -> dict:
     if not re.fullmatch(r"[0-9a-f]{40,64}", gitops_revision):
         raise ValueError("A resolved immutable staging GitOps commit is required")
     payload["gitops_revision"] = gitops_revision
-    sbom, sbom_bytes = read_json(os.environ["SBOM_PATH"])
+    sbom, _ = read_json(os.environ["SBOM_PATH"])
+    sbom_bundle, _ = read_json(os.environ["SBOM_BUNDLE_PATH"])
     signature_bundle, _ = read_json(os.environ["SIGNATURE_BUNDLE_PATH"])
     provenance_bundle, _ = read_json(os.environ["PROVENANCE_BUNDLE_PATH"])
     for label, bundle in (
@@ -107,6 +113,8 @@ def build_payload() -> dict:
     ):
         if len(json.dumps(bundle, separators=(",", ":")).encode("utf-8")) > 100 * 1024:
             raise ValueError(f"{label} bundle exceeds DeployForge's per-bundle size limit")
+    if len(json.dumps(sbom_bundle, separators=(",", ":")).encode("utf-8")) > 6 * 1024 * 1024:
+        raise ValueError("SBOM attestation bundle exceeds DeployForge's 6 MiB limit")
     if sbom.get("bomFormat") != "CycloneDX":
         raise ValueError("The generated SBOM is not CycloneDX JSON")
 
@@ -121,8 +129,9 @@ def build_payload() -> dict:
             "uri": f"oci://{image}@{image_digest}",
             "digest": image_digest,
             "sbom_format": "cyclonedx-json",
-            "sbom_uri": run_url,
-            "sbom_digest": "sha256:" + hashlib.sha256(sbom_bytes).hexdigest(),
+            "sbom_uri": os.environ.get("SBOM_URI", "").strip() or run_url,
+            "sbom_digest": canonical_json_digest(sbom),
+            "sbom_bundle": sbom_bundle,
             "vulnerability_summary": vulnerability_summary(
                 os.environ["VULNERABILITY_REPORT_PATH"]
             ),
@@ -172,8 +181,8 @@ def main() -> int:
         raise ValueError("The DeployForge callback secret is required")
 
     body = json.dumps(build_payload(), separators=(",", ":")).encode("utf-8")
-    if len(body) > 256 * 1024:
-        raise ValueError("Build evidence exceeds DeployForge's callback size limit")
+    if len(body) > 12 * 1024 * 1024:
+        raise ValueError("Build evidence exceeds DeployForge's 12 MiB callback size limit")
     for attempt in range(1, 6):
         timestamp = str(int(time.time()))
         digest = hmac.new(

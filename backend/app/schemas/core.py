@@ -1093,6 +1093,7 @@ class BuildArtifactEvidence(BaseModel):
     sbom_format: Literal["cyclonedx-json", "spdx-json"]
     sbom_uri: str = Field(max_length=1000)
     sbom_digest: Digest
+    sbom_bundle: dict[str, Any] | None = None
     vulnerability_summary: VulnerabilitySummary
     signature_uri: str = Field(max_length=1000)
     signature_bundle: dict[str, Any] | None = None
@@ -1122,6 +1123,18 @@ class BuildArtifactEvidence(BaseModel):
         )
         if bundle_size > 100 * 1024:
             raise ValueError("Each inline Sigstore bundle must be at most 100 KiB")
+        return value
+
+    @field_validator("sbom_bundle")
+    @classmethod
+    def limit_sbom_bundle_size(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
+        bundle_size = (
+            len(json.dumps(value, separators=(",", ":")).encode("utf-8"))
+            if value is not None
+            else 0
+        )
+        if bundle_size > 6 * 1024 * 1024:
+            raise ValueError("The SBOM attestation bundle must be at most 6 MiB")
         return value
 
 
