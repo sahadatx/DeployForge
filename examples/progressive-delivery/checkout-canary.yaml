@@ -1,0 +1,107 @@
+# Replace the example image with a verified immutable image digest before use.
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: checkout-success-rate
+spec:
+  args:
+    - name: service-name
+  metrics:
+    - name: http-success-rate
+      interval: 1m
+      count: 3
+      failureLimit: 2
+      successCondition: result[0] >= 0.99
+      provider:
+        prometheus:
+          address: http://prometheus-operated.monitoring.svc:9090
+          timeout: 20
+          query: |
+            sum(rate(http_requests_total{service="{{args.service-name}}",status!~"5.."}[5m]))
+            /
+            sum(rate(http_requests_total{service="{{args.service-name}}"}[5m]))
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: checkout-stable
+spec:
+  selector:
+    app: checkout
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: checkout-canary
+spec:
+  selector:
+    app: checkout
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: checkout
+spec:
+  replicas: 10
+  selector:
+    matchLabels:
+      app: checkout
+  template:
+    metadata:
+      labels:
+        app: checkout
+    spec:
+      containers:
+        - name: checkout
+          image: ghcr.io/acme/checkout@sha256:REPLACE_WITH_64_HEX_DIGEST
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            periodSeconds: 5
+  strategy:
+    canary:
+      stableService: checkout-stable
+      canaryService: checkout-canary
+      maxSurge: 1
+      maxUnavailable: 0
+      steps:
+        - setWeight: 10
+        - pause:
+            duration: 5m
+        - analysis:
+            templates:
+              - templateName: checkout-success-rate
+            args:
+              - name: service-name
+                value: checkout
+        - setWeight: 25
+        - pause:
+            duration: 5m
+        - analysis:
+            templates:
+              - templateName: checkout-success-rate
+            args:
+              - name: service-name
+                value: checkout
+        - setWeight: 50
+        - pause:
+            duration: 5m
+        - analysis:
+            templates:
+              - templateName: checkout-success-rate
+            args:
+              - name: service-name
+                value: checkout
+        - setWeight: 100
