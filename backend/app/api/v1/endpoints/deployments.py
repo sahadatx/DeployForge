@@ -6,21 +6,42 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from app.api.deps import get_current_identity, get_db, require_csrf
-from app.core.authorization import require_workspace_access
-from app.core.builds import create_build_run, transition_build_run
+from app.core.authorization import (
+    require_verified_approval_identity,
+    require_workspace_access,
+)
+from app.core.builds import (
+    create_artifact_promotion_build_run,
+    create_build_run,
+    evaluate_artifact_policy_for_release,
+    transition_build_run,
+)
+from app.core.config import settings
 from app.core.deployments import (
     DeploymentTransitionConflict,
+    active_deployment_freeze_until,
     append_deployment_event,
     transition_deployment,
 )
 from app.core.gitops import create_gitops_run, transition_gitops_run
-from app.models import BuildRun, Deployment, Environment, GitOpsRun, Service, User, UserSession
+from app.models import (
+    BuildArtifact,
+    BuildRun,
+    Deployment,
+    Environment,
+    GitOpsRun,
+    GitOpsTarget,
+    Service,
+    User,
+    UserSession,
+)
 from app.schemas.core import (
     DeploymentApprovalRequest,
     DeploymentContract,
     DeploymentEventContract,
     DeploymentRequest,
     DeploymentRetryResponse,
+    PromotableArtifactContract,
 )
 
 router = APIRouter()
@@ -69,6 +90,81 @@ def list_deployments(
     )
 
 
+@router.get(
+    "/workspaces/{workspace_id}/promotion-artifacts",
+    response_model=list[PromotableArtifactContract],
+    summary="List successfully deployed immutable artifacts eligible for promotion",
+)
+def list_promotion_artifacts(
+    workspace_id: UUID,
+    service_id: UUID,
+    environment_id: UUID,
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    identity: tuple[User, UserSession] = Depends(get_current_identity),
+    db: Session = Depends(get_db),
+) -> list[PromotableArtifactContract]:
+    require_workspace_access(db, identity[0], workspace_id)
+    service = db.scalar(
+        select(Service).where(Service.workspace_id == workspace_id, Service.id == service_id)
+    )
+    environment = db.scalar(
+        select(Environment).where(
+            Environment.workspace_id == workspace_id,
+            Environment.id == environment_id,
+        )
+    )
+    if service is None or environment is None:
+        raise HTTPException(
+            status_code=422,
+            detail="Service and target environment must belong to this workspace",
+        )
+    successful_gitops_builds = select(GitOpsRun.build_run_id).where(
+        GitOpsRun.status == "succeeded",
+        GitOpsRun.action_kind == "deploy",
+    )
+    query = (
+        select(BuildArtifact, BuildRun, Deployment)
+        .join(BuildRun, BuildRun.id == BuildArtifact.build_run_id)
+        .join(Deployment, Deployment.id == BuildRun.deployment_id)
+        .where(
+            BuildArtifact.workspace_id == workspace_id,
+            BuildArtifact.artifact_type == "container",
+            BuildRun.status == "succeeded",
+            BuildRun.id.in_(successful_gitops_builds),
+            Deployment.workspace_id == workspace_id,
+            Deployment.service_id == service_id,
+            Deployment.environment_id != environment_id,
+            Deployment.status == "succeeded",
+        )
+    )
+    if settings.require_verified_supply_chain:
+        query = query.where(BuildArtifact.evidence_status == "verified")
+    rows = db.execute(
+        query.order_by(BuildArtifact.created_at.desc(), BuildArtifact.id)
+        .limit(limit)
+        .offset(offset)
+    ).all()
+    return [
+        PromotableArtifactContract(
+            id=artifact.id,
+            name=artifact.name,
+            uri=artifact.uri,
+            digest=artifact.digest,
+            artifact_type=artifact.artifact_type,
+            evidence_status=artifact.evidence_status,
+            source_build_run_id=build_run.id,
+            source_deployment_id=deployment.id,
+            source_environment_id=deployment.environment_id,
+            source_version=deployment.version,
+            source_ref=build_run.source_ref,
+            commit_sha=build_run.commit_sha,
+            created_at=artifact.created_at,
+        )
+        for artifact, build_run, deployment in rows
+    ]
+
+
 @router.post(
     "/workspaces/{workspace_id}/deployments",
     response_model=DeploymentContract,
@@ -100,6 +196,12 @@ def request_deployment(
                 existing.service_id != payload.service_id
                 or existing.environment_id != payload.environment_id
                 or existing.version != payload.version
+                or existing.promoted_artifact_id != payload.artifact_id
+                or existing.promotion_gitops_revision != payload.gitops_revision
+                or (
+                    payload.artifact_id is None
+                    and existing.source_ref != (payload.source_ref or payload.version)
+                )
             ):
                 raise HTTPException(
                     status_code=409,
@@ -126,12 +228,79 @@ def request_deployment(
     if environment is None:
         raise HTTPException(status_code=422, detail="Environment must belong to this workspace")
 
+    source_build_run = None
+    source_artifact = None
+    if payload.artifact_id is not None:
+        source = db.execute(
+            select(BuildArtifact, BuildRun, Deployment)
+            .join(BuildRun, BuildRun.id == BuildArtifact.build_run_id)
+            .join(Deployment, Deployment.id == BuildRun.deployment_id)
+            .where(
+                BuildArtifact.id == payload.artifact_id,
+                BuildArtifact.workspace_id == workspace_id,
+                BuildArtifact.artifact_type == "container",
+                BuildRun.status == "succeeded",
+                Deployment.workspace_id == workspace_id,
+                Deployment.service_id == service.id,
+                Deployment.environment_id != environment.id,
+                Deployment.status == "succeeded",
+            )
+        ).first()
+        if source is None:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Promotion artifact must belong to this service and have a healthy "
+                    "deployment in another environment"
+                ),
+            )
+        source_artifact, source_build_run, _source_deployment = source
+        successful_source_run = db.scalar(
+            select(GitOpsRun.id).where(
+                GitOpsRun.build_run_id == source_build_run.id,
+                GitOpsRun.action_kind == "deploy",
+                GitOpsRun.status == "succeeded",
+            )
+        )
+        if successful_source_run is None:
+            raise HTTPException(
+                status_code=422,
+                detail="Promotion requires a successful GitOps deployment of the source artifact",
+            )
+        if settings.require_verified_supply_chain and source_artifact.evidence_status != "verified":
+            raise HTTPException(
+                status_code=422,
+                detail="Production promotion requires independently verified artifact evidence",
+            )
+        target = db.scalar(
+            select(GitOpsTarget).where(
+                GitOpsTarget.workspace_id == workspace_id,
+                GitOpsTarget.service_id == service.id,
+                GitOpsTarget.environment_id == environment.id,
+                GitOpsTarget.enabled.is_(True),
+            )
+        )
+        if target and target.artifact_name and target.artifact_name != source_artifact.name:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "The selected artifact does not match the GitOps target's configured "
+                    "artifact name"
+                ),
+            )
+
     deployment = Deployment(
         workspace_id=workspace_id,
         service_id=service.id,
         environment_id=environment.id,
         version=payload.version,
-        source_ref=payload.source_ref or payload.version,
+        source_ref=(
+            source_build_run.source_ref
+            if source_build_run is not None
+            else payload.source_ref or payload.version
+        ),
+        promoted_artifact_id=source_artifact.id if source_artifact else None,
+        promotion_gitops_revision=payload.gitops_revision,
         status="queued",
         requested_by=str(actor.id),
         idempotency_key=normalized_key,
@@ -154,6 +323,10 @@ def request_deployment(
                 "environment_id": str(environment.id),
                 "version": deployment.version,
                 "source_ref": deployment.source_ref,
+                "promoted_artifact_id": str(deployment.promoted_artifact_id)
+                if deployment.promoted_artifact_id
+                else None,
+                "promotion_gitops_revision": deployment.promotion_gitops_revision,
                 "approval_required": True,
             },
         )
@@ -172,6 +345,12 @@ def request_deployment(
                 and existing.service_id == payload.service_id
                 and existing.environment_id == payload.environment_id
                 and existing.version == payload.version
+                and existing.promoted_artifact_id == payload.artifact_id
+                and existing.promotion_gitops_revision == payload.gitops_revision
+                and (
+                    payload.artifact_id is not None
+                    or existing.source_ref == (payload.source_ref or payload.version)
+                )
             ):
                 response.status_code = status.HTTP_200_OK
                 return existing
@@ -230,10 +409,24 @@ def decide_deployment_approval(
     deployment = _load_deployment(db, workspace_id, deployment_id)
     if deployment.status not in {"awaiting_approval", "awaiting_release_approval"}:
         raise HTTPException(status_code=409, detail="Deployment is not awaiting approval")
+    environment = db.get(Environment, deployment.environment_id)
+    freeze_until = active_deployment_freeze_until(environment) if environment else None
+    if freeze_until is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"This environment is in a deployment freeze until {freeze_until.isoformat()}",
+        )
     if deployment.requested_by == str(actor.id):
         raise HTTPException(
             status_code=403, detail="The requester cannot approve their own deployment"
         )
+    require_verified_approval_identity(
+        db,
+        actor,
+        workspace_id=workspace_id,
+        resource_type="deployment",
+        resource_id=deployment.id,
+    )
     approved = payload.decision == "approve"
     try:
         if deployment.status == "awaiting_release_approval":
@@ -271,6 +464,24 @@ def decide_deployment_approval(
             db.refresh(deployment)
             return deployment
 
+        promotion_source: tuple[BuildRun, BuildArtifact] | None = None
+        if approved and deployment.promoted_artifact_id is not None:
+            artifact = db.get(BuildArtifact, deployment.promoted_artifact_id)
+            source_build = db.get(BuildRun, artifact.build_run_id) if artifact is not None else None
+            if (
+                artifact is None
+                or source_build is None
+                or source_build.status != "succeeded"
+                or deployment.promotion_gitops_revision is None
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "The immutable source artifact or target manifest revision is unavailable"
+                    ),
+                )
+            promotion_source = (source_build, artifact)
+
         transition_deployment(
             db,
             deployment,
@@ -290,22 +501,127 @@ def decide_deployment_approval(
                 raise HTTPException(
                     status_code=409, detail="Deployment service is no longer available"
                 )
-            build_run = create_build_run(db, deployment, service, actor=actor)
-            append_deployment_event(
-                db,
-                deployment,
-                event_type="build.queued" if build_run.status == "queued" else "build.blocked",
-                from_status="approved",
-                to_status="approved",
-                message=(
-                    "Approved release passed to the CI build queue."
-                    if build_run.status == "queued"
-                    else build_run.failure_message
-                    or "Approved release is blocked by build configuration."
-                ),
-                actor=actor,
-                details={"build_run_id": str(build_run.id), "build_status": build_run.status},
-            )
+            if promotion_source is not None:
+                source_build, source_artifact = promotion_source
+                build_run = create_artifact_promotion_build_run(
+                    db,
+                    deployment,
+                    source_build,
+                    source_artifact,
+                    gitops_revision=deployment.promotion_gitops_revision,
+                    actor=actor,
+                )
+                transition_deployment(
+                    db,
+                    deployment,
+                    "building",
+                    event_type="promotion.artifact_reused",
+                    message=(
+                        "Approval granted; the previously deployed artifact is reused "
+                        "without rebuilding."
+                    ),
+                    actor=actor,
+                    details={
+                        "build_run_id": str(build_run.id),
+                        "source_build_run_id": str(source_build.id),
+                        "source_artifact_id": str(source_artifact.id),
+                        "artifact_digest": source_artifact.digest,
+                        "gitops_revision": deployment.promotion_gitops_revision,
+                    },
+                )
+                try:
+                    evaluation = evaluate_artifact_policy_for_release(db, deployment, build_run)
+                except ValueError as exc:
+                    transition_deployment(
+                        db,
+                        deployment,
+                        "failed",
+                        event_type="policy.context_unavailable",
+                        message=(
+                            "Artifact policy evaluation context is unavailable for this promotion."
+                        ),
+                        actor_type="policy",
+                        actor_id="policy-engine",
+                        details={"build_run_id": str(build_run.id)},
+                        failure_code="policy_context_unavailable",
+                        failure_message=str(exc),
+                    )
+                else:
+                    if evaluation.decision == "deny":
+                        message = (
+                            "Promoted artifact was blocked by the enforced workspace policy set."
+                        )
+                        transition_deployment(
+                            db,
+                            deployment,
+                            "failed",
+                            event_type="policy.blocked_after_build",
+                            message=message,
+                            actor_type="policy",
+                            actor_id="policy-engine",
+                            details={
+                                "build_run_id": str(build_run.id),
+                                "policy_evaluation_id": str(evaluation.id),
+                                "policy_snapshot_sha256": evaluation.policy_snapshot_sha256,
+                            },
+                            failure_code="policy_denied",
+                            failure_message=message,
+                        )
+                    elif evaluation.requires_approval:
+                        transition_deployment(
+                            db,
+                            deployment,
+                            "awaiting_release_approval",
+                            event_type="policy.release_approval_required",
+                            message=(
+                                "Artifact policy requires an independent approval before "
+                                "GitOps deployment."
+                            ),
+                            actor_type="policy",
+                            actor_id="policy-engine",
+                            details={
+                                "build_run_id": str(build_run.id),
+                                "policy_evaluation_id": str(evaluation.id),
+                                "policy_snapshot_sha256": evaluation.policy_snapshot_sha256,
+                            },
+                        )
+                    else:
+                        transition_deployment(
+                            db,
+                            deployment,
+                            "ready_to_deploy",
+                            event_type="promotion.ready",
+                            message=(
+                                "Promoted artifact passed policy and is ready for target "
+                                "manifest reconciliation."
+                            ),
+                            actor=actor,
+                            details={
+                                "build_run_id": str(build_run.id),
+                                "artifact_digest": source_artifact.digest,
+                                "gitops_revision": deployment.promotion_gitops_revision,
+                                "policy_evaluation_id": str(evaluation.id),
+                                "policy_snapshot_sha256": evaluation.policy_snapshot_sha256,
+                            },
+                        )
+                        create_gitops_run(db, deployment, build_run, actor=actor)
+            else:
+                build_run = create_build_run(db, deployment, service, actor=actor)
+                append_deployment_event(
+                    db,
+                    deployment,
+                    event_type="build.queued" if build_run.status == "queued" else "build.blocked",
+                    from_status="approved",
+                    to_status="approved",
+                    message=(
+                        "Approved release passed to the CI build queue."
+                        if build_run.status == "queued"
+                        else build_run.failure_message
+                        or "Approved release is blocked by build configuration."
+                    ),
+                    actor=actor,
+                    details={"build_run_id": str(build_run.id), "build_status": build_run.status},
+                )
     except DeploymentTransitionConflict as exc:
         db.rollback()
         raise HTTPException(status_code=409, detail=str(exc)) from exc

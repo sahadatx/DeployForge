@@ -3,7 +3,7 @@
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import Session
 
 from app.core.audit import record_audit
@@ -38,6 +38,25 @@ ALLOWED_TRANSITIONS: dict[str, set[str]] = {
 
 class DeploymentTransitionConflict(Exception):
     """Raised when another worker or operator changed a release concurrently."""
+
+
+def active_deployment_freeze_until(
+    environment: Environment, *, now: datetime | None = None
+) -> datetime | None:
+    now = now or datetime.now(UTC)
+    starts_at = environment.deployment_freeze_start_at
+    ends_at = environment.deployment_freeze_until
+    if starts_at is None or ends_at is None:
+        return None
+    if starts_at.tzinfo is None:
+        starts_at = starts_at.replace(tzinfo=UTC)
+    else:
+        starts_at = starts_at.astimezone(UTC)
+    if ends_at.tzinfo is None:
+        ends_at = ends_at.replace(tzinfo=UTC)
+    else:
+        ends_at = ends_at.astimezone(UTC)
+    return ends_at if starts_at <= now < ends_at else None
 
 
 def append_deployment_event(
@@ -225,7 +244,15 @@ def claim_next_deployment(db: Session, worker_name: str) -> UUID | None:
     now = datetime.now(UTC)
     candidate = db.scalar(
         select(Deployment)
+        .join(Environment, Environment.id == Deployment.environment_id)
         .where(Deployment.status == "queued", Deployment.available_at <= now)
+        .where(
+            or_(
+                Environment.deployment_freeze_start_at.is_(None),
+                Environment.deployment_freeze_start_at > now,
+                Environment.deployment_freeze_until <= now,
+            )
+        )
         .order_by(Deployment.created_at, Deployment.id)
         .limit(1)
     )
@@ -306,6 +333,26 @@ def process_claimed_deployment(db: Session, deployment_id: UUID, worker_name: st
             failure_code="catalog_validation_failed",
             failure_message=reason,
         )
+        db.commit()
+        return True
+
+    freeze_until = active_deployment_freeze_until(environment)
+    if freeze_until is not None:
+        transition_deployment(
+            db,
+            deployment,
+            "queued",
+            event_type="deployment.freeze_deferred",
+            message="Deployment is deferred until the scheduled environment freeze ends.",
+            actor_type="worker",
+            actor_id=worker_name,
+            details={
+                "environment_id": str(environment.id),
+                "freeze_until": freeze_until.isoformat(),
+                "reason": environment.deployment_freeze_reason,
+            },
+        )
+        deployment.available_at = freeze_until
         db.commit()
         return True
 

@@ -21,6 +21,7 @@ from app.models import (
     BuildRun,
     Deployment,
     Environment,
+    GitOpsRolloutAction,
     GitOpsRun,
     GitOpsTarget,
     Service,
@@ -29,6 +30,8 @@ from app.models import (
 )
 from app.schemas.core import (
     ArgoApplicationStatus,
+    GitOpsRolloutActionContract,
+    GitOpsRolloutActionCreate,
     GitOpsRunContract,
     GitOpsRunDetail,
     GitOpsTargetContract,
@@ -60,7 +63,9 @@ def _load_run(
         GitOpsRun.id == gitops_run_id,
     )
     if detail:
-        query = query.options(selectinload(GitOpsRun.events))
+        query = query.options(
+            selectinload(GitOpsRun.events), selectinload(GitOpsRun.rollout_actions)
+        )
     run = db.scalar(query)
     if run is None:
         raise HTTPException(status_code=404, detail="GitOps run not found")
@@ -70,7 +75,7 @@ def _load_run(
 @router.get(
     "/workspaces/{workspace_id}/gitops-targets",
     response_model=list[GitOpsTargetContract],
-    summary="List service and environment Argo CD bindings",
+    summary="List service and environment GitOps bindings",
 )
 def list_gitops_targets(
     workspace_id: UUID,
@@ -91,7 +96,7 @@ def list_gitops_targets(
     "/workspaces/{workspace_id}/gitops-targets",
     response_model=GitOpsTargetContract,
     status_code=status.HTTP_201_CREATED,
-    summary="Register an Argo CD Application target",
+    summary="Register an Argo CD Application or Flux Kustomization target",
 )
 def create_gitops_target(
     workspace_id: UUID,
@@ -117,15 +122,49 @@ def create_gitops_target(
     )
     if environment is None:
         raise HTTPException(status_code=422, detail="Environment must belong to this workspace")
+    if payload.provider == "flux":
+        if len(payload.application_name) > 63:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Flux target names must be at most 63 characters for workload identity labels"
+                ),
+            )
+        if not payload.reconciliation_namespace:
+            raise HTTPException(
+                status_code=422, detail="Flux targets require a Kustomization namespace"
+            )
+        if not environment.namespace or not environment.cluster_name:
+            raise HTTPException(
+                status_code=422,
+                detail="Flux targets require an environment cluster name and target namespace",
+            )
+        if (
+            payload.expected_cluster_name
+            and payload.expected_cluster_name != environment.cluster_name
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="Flux target cluster must match the environment cluster",
+            )
+    elif payload.reconciliation_namespace:
+        raise HTTPException(
+            status_code=422,
+            detail="Reconciliation namespace is only used by Flux targets",
+        )
     target = GitOpsTarget(
         workspace_id=workspace_id,
         service_id=service.id,
         environment_id=environment.id,
         application_name=payload.application_name,
+        provider=payload.provider,
         expected_project=payload.expected_project.strip(),
         expected_cluster_name=(
-            payload.expected_cluster_name.strip() if payload.expected_cluster_name else None
+            payload.expected_cluster_name.strip()
+            if payload.expected_cluster_name
+            else environment.cluster_name if payload.provider == "flux" else None
         ),
+        reconciliation_namespace=payload.reconciliation_namespace,
         artifact_name=payload.artifact_name.strip() if payload.artifact_name else None,
         enabled=payload.enabled,
         created_by=actor.id,
@@ -142,10 +181,12 @@ def create_gitops_target(
             workspace_id=workspace_id,
             details={
                 "application_name": target.application_name,
+                "provider": target.provider,
                 "service_id": str(service.id),
                 "environment_id": str(environment.id),
                 "expected_project": target.expected_project,
                 "expected_cluster_name": target.expected_cluster_name,
+                "reconciliation_namespace": target.reconciliation_namespace,
             },
         )
         db.commit()
@@ -164,7 +205,7 @@ def create_gitops_target(
 @router.patch(
     "/workspaces/{workspace_id}/gitops-targets/{target_id}",
     response_model=GitOpsTargetContract,
-    summary="Update or disable an Argo CD target binding",
+    summary="Update or disable a GitOps target binding",
 )
 def patch_gitops_target(
     workspace_id: UUID,
@@ -179,13 +220,54 @@ def patch_gitops_target(
     updates = payload.model_dump(exclude_unset=True)
     if not updates:
         raise HTTPException(status_code=422, detail="Provide at least one GitOps target field")
-    for field in ("expected_project", "expected_cluster_name", "artifact_name"):
+    for field in (
+        "expected_project",
+        "expected_cluster_name",
+        "reconciliation_namespace",
+        "artifact_name",
+    ):
         if field in updates and isinstance(updates[field], str):
             updates[field] = updates[field].strip() or None
     if "application_name" in updates and updates["application_name"] is None:
-        raise HTTPException(status_code=422, detail="Argo CD application name cannot be blank")
+        raise HTTPException(status_code=422, detail="GitOps resource name cannot be blank")
+    if "provider" in updates and updates["provider"] is None:
+        raise HTTPException(status_code=422, detail="GitOps provider cannot be blank")
     if updates.get("expected_project") is None and "expected_project" in updates:
         raise HTTPException(status_code=422, detail="Argo CD project cannot be blank")
+    environment = db.get(Environment, target.environment_id)
+    provider = updates.get("provider", target.provider)
+    reconciliation_namespace = updates.get(
+        "reconciliation_namespace", target.reconciliation_namespace
+    )
+    expected_cluster_name = updates.get("expected_cluster_name", target.expected_cluster_name)
+    if provider == "flux":
+        application_name = updates.get("application_name", target.application_name)
+        if len(application_name) > 63:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Flux target names must be at most 63 characters for workload identity labels"
+                ),
+            )
+        if not reconciliation_namespace:
+            raise HTTPException(
+                status_code=422, detail="Flux targets require a Kustomization namespace"
+            )
+        if not environment or not environment.namespace or not environment.cluster_name:
+            raise HTTPException(
+                status_code=422,
+                detail="Flux targets require an environment cluster name and target namespace",
+            )
+        if expected_cluster_name != environment.cluster_name:
+            raise HTTPException(
+                status_code=422,
+                detail="Flux target cluster must match the environment cluster",
+            )
+    elif reconciliation_namespace:
+        raise HTTPException(
+            status_code=422,
+            detail="Reconciliation namespace is only used by Flux targets",
+        )
     for key, value in updates.items():
         setattr(target, key, value)
     try:
@@ -196,7 +278,11 @@ def patch_gitops_target(
             resource_type="gitops_target",
             resource_id=target.id,
             workspace_id=workspace_id,
-            details={"updated_fields": sorted(updates)},
+            details={
+                "updated_fields": sorted(updates),
+                "provider": target.provider,
+                "reconciliation_namespace": target.reconciliation_namespace,
+            },
         )
         db.commit()
     except IntegrityError as exc:
@@ -211,7 +297,7 @@ def patch_gitops_target(
 @router.get(
     "/workspaces/{workspace_id}/gitops-targets/{target_id}/status",
     response_model=ArgoApplicationStatus,
-    summary="Read Argo CD sync, health, revision, and cluster destination",
+    summary="Read GitOps controller sync, health, revision, and destination",
 )
 def get_gitops_target_status(
     workspace_id: UUID,
@@ -221,7 +307,7 @@ def get_gitops_target_status(
 ) -> dict:
     require_workspace_access(db, identity[0], workspace_id)
     target = _load_target(db, workspace_id, target_id)
-    return read_target_status(target)
+    return read_target_status(db, target)
 
 
 @router.get(
@@ -266,6 +352,128 @@ def get_gitops_run(
     return _load_run(db, workspace_id, gitops_run_id, detail=True)
 
 
+def _queue_rollout_action(
+    workspace_id: UUID,
+    gitops_run_id: UUID,
+    action_name: str,
+    payload: GitOpsRolloutActionCreate,
+    identity: tuple[User, UserSession],
+    db: Session,
+) -> GitOpsRolloutAction:
+    actor = identity[0]
+    require_workspace_access(db, actor, workspace_id, roles=GITOPS_OPERATOR_ROLES)
+    if not settings.argo_rollouts_available:
+        raise HTTPException(status_code=409, detail="Argo Rollouts integration is not configured")
+    run = _load_run(db, workspace_id, gitops_run_id)
+    if run.action_kind != "deploy" or run.status not in {"syncing", "verifying"}:
+        raise HTTPException(
+            status_code=409, detail="Only active deployment rollouts can be controlled"
+        )
+    target = db.get(GitOpsTarget, run.target_id) if run.target_id else None
+    deployment = db.get(Deployment, run.deployment_id)
+    environment = db.get(Environment, deployment.environment_id) if deployment else None
+    if target is None or not target.enabled or environment is None or not environment.namespace:
+        raise HTTPException(
+            status_code=409, detail="The active rollout target has no enabled namespace"
+        )
+    if target.provider != "argocd":
+        raise HTTPException(
+            status_code=409,
+            detail="Argo Rollouts controls are available only for Argo CD targets",
+        )
+    snapshot = run.rollout_snapshot or {}
+    if snapshot.get("observation_error"):
+        raise HTTPException(
+            status_code=409, detail="The latest Argo Rollouts observation is unavailable"
+        )
+    phase = str(snapshot.get("phase") or "")
+    step_index = snapshot.get("current_step_index")
+    if action_name == "promote" and (
+        snapshot.get("paused") is not True or not isinstance(step_index, int)
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Stage promotion is available only while the rollout is paused at a known step",
+        )
+    if action_name == "abort" and phase.casefold() not in {"paused", "progressing"}:
+        raise HTTPException(status_code=409, detail="The current rollout stage cannot be aborted")
+    comment = payload.comment.strip()
+    if len(comment) < 3:
+        raise HTTPException(status_code=422, detail="A reason of at least 3 characters is required")
+    action = GitOpsRolloutAction(
+        gitops_run_id=run.id,
+        workspace_id=workspace_id,
+        requested_by=actor.id,
+        action=action_name,
+        status="queued",
+        comment=comment,
+        requested_step=str(step_index) if isinstance(step_index, int) else None,
+        requested_rollout_status=phase[:40] or None,
+    )
+    db.add(action)
+    try:
+        db.flush()
+        from app.core.gitops import append_gitops_event
+
+        append_gitops_event(
+            db,
+            run,
+            event_type="rollout_action.queued",
+            from_status=run.status,
+            to_status=run.status,
+            message=f"{action_name.title()} stage action queued by an operator.",
+            actor=actor,
+            details={
+                "action_id": str(action.id),
+                "action": action_name,
+                "step": action.requested_step,
+                "rollout_phase": action.requested_rollout_status,
+                "comment": comment,
+            },
+        )
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="Another rollout action is already queued or being dispatched for this run",
+        ) from exc
+    db.refresh(action)
+    return action
+
+
+@router.post(
+    "/workspaces/{workspace_id}/gitops-runs/{gitops_run_id}/promote",
+    response_model=GitOpsRolloutActionContract,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Queue promotion of the current Argo Rollouts stage",
+)
+def promote_gitops_rollout(
+    workspace_id: UUID,
+    gitops_run_id: UUID,
+    payload: GitOpsRolloutActionCreate,
+    identity: tuple[User, UserSession] = Depends(require_csrf),
+    db: Session = Depends(get_db),
+) -> GitOpsRolloutAction:
+    return _queue_rollout_action(workspace_id, gitops_run_id, "promote", payload, identity, db)
+
+
+@router.post(
+    "/workspaces/{workspace_id}/gitops-runs/{gitops_run_id}/abort",
+    response_model=GitOpsRolloutActionContract,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Queue abort of the active Argo Rollouts stage",
+)
+def abort_gitops_rollout(
+    workspace_id: UUID,
+    gitops_run_id: UUID,
+    payload: GitOpsRolloutActionCreate,
+    identity: tuple[User, UserSession] = Depends(require_csrf),
+    db: Session = Depends(get_db),
+) -> GitOpsRolloutAction:
+    return _queue_rollout_action(workspace_id, gitops_run_id, "abort", payload, identity, db)
+
+
 @router.post(
     "/workspaces/{workspace_id}/gitops-runs/{gitops_run_id}/retry",
     response_model=GitOpsRunContract,
@@ -282,8 +490,6 @@ def retry_gitops_run(
     run = _load_run(db, workspace_id, gitops_run_id)
     if run.status != "blocked":
         raise HTTPException(status_code=409, detail="Only blocked GitOps runs can be retried")
-    if not settings.argocd_configured:
-        raise HTTPException(status_code=409, detail="Argo CD integration is not configured")
     deployment = db.get(Deployment, run.deployment_id)
     if deployment is None or deployment.status not in {"ready_to_deploy", "rollback_pending"}:
         raise HTTPException(
@@ -291,7 +497,12 @@ def retry_gitops_run(
         )
     target = _load_target_for_deployment(db, workspace_id, deployment)
     if not target.enabled:
-        raise HTTPException(status_code=409, detail="Argo CD target is disabled")
+        raise HTTPException(status_code=409, detail="GitOps target is disabled")
+    provider_available = (
+        settings.flux_available if target.provider == "flux" else settings.argocd_available
+    )
+    if not provider_available:
+        raise HTTPException(status_code=409, detail="GitOps provider is not configured")
     run.target_id = target.id
     run.application_name = target.application_name
     if run.action_kind == "deploy":
@@ -339,7 +550,7 @@ def _load_target_for_deployment(
     )
     if target is None:
         raise HTTPException(
-            status_code=409, detail="Register an Argo CD target for this service/environment"
+            status_code=409, detail="Register a GitOps target for this service/environment"
         )
     return target
 
