@@ -5,6 +5,7 @@ from urllib.parse import quote, urlsplit
 
 import httpx
 
+from app.core.config import settings
 from app.models import BuildRun
 
 GITHUB_API_VERSION = "2022-11-28"
@@ -26,9 +27,15 @@ class GitHubDispatchError(Exception):
 
 def parse_github_repository(repository_url: str) -> tuple[str, str]:
     parsed = urlsplit(repository_url)
+    configured_server = urlsplit(settings.github_server_url)
+    try:
+        same_port = parsed.port == configured_server.port
+    except ValueError:
+        same_port = False
     if (
         parsed.scheme != "https"
-        or parsed.hostname != "github.com"
+        or parsed.hostname != configured_server.hostname
+        or not same_port
         or parsed.username
         or parsed.password
         or parsed.query
@@ -36,7 +43,7 @@ def parse_github_repository(repository_url: str) -> tuple[str, str]:
     ):
         raise GitHubDispatchError(
             "unsupported_repository_provider",
-            "CI dispatch currently supports canonical github.com repository URLs.",
+            "Repository URL must use the configured GitHub server.",
         )
     path = parsed.path.strip("/")
     parts = path.split("/")
