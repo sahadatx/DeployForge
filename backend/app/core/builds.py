@@ -15,11 +15,27 @@ from app.core.config import settings
 from app.core.deployments import transition_deployment
 from app.core.gitops import create_gitops_run
 from app.core.policies import evaluate_policy_set
+from app.integrations.azure_devops import (
+    AzurePipelineConfiguration,
+    AzurePipelineError,
+    azure_pipeline_reference,
+    parse_azure_repository,
+    pipeline_binding_for_repository,
+)
+from app.integrations.azure_devops import (
+    dispatch_pipeline as dispatch_azure_pipeline,
+)
 from app.integrations.github_actions import (
     DispatchConfiguration,
     GitHubDispatchError,
     dispatch_workflow,
     parse_github_repository,
+)
+from app.integrations.gitlab_ci import (
+    GitLabPipelineConfiguration,
+    GitLabPipelineError,
+    dispatch_pipeline,
+    parse_gitlab_repository,
 )
 from app.models import (
     BuildArtifact,
@@ -52,6 +68,14 @@ BUILD_TRANSITIONS: dict[str, set[str]] = {
     "succeeded": set(),
     "canceled": set(),
 }
+
+
+def _build_provider_label(provider: str) -> str:
+    return {
+        "azure_devops": "Azure DevOps",
+        "gitlab_ci": "GitLab CI",
+        "github_actions": "GitHub Actions",
+    }.get(provider, "CI provider")
 
 
 class BuildRunTransitionConflict(Exception):
@@ -194,14 +218,27 @@ def create_build_run(
     initial_status = "queued"
     failure_code = None
     failure_message = None
+    provider = settings.build_provider
+    workflow_path = settings.github_actions_workflow_path
+    if provider == "azure_devops":
+        workflow_path = "azure-pipeline:unmapped"
     if not repository_url:
         initial_status = "blocked"
         failure_code = "source_repository_missing"
         failure_message = "Register a source repository for this service before building it."
     else:
         try:
-            parse_github_repository(repository_url)
-        except GitHubDispatchError as exc:
+            _parse_source_repository(repository_url, provider)
+            if provider == "gitlab_ci":
+                workflow_path = settings.gitlab_ci_config_path
+            elif provider == "azure_devops":
+                binding = pipeline_binding_for_repository(
+                    repository_url,
+                    settings.azure_devops_organization_url,
+                    settings.azure_devops_pipeline_map,
+                )
+                workflow_path = azure_pipeline_reference(binding)
+        except (GitHubDispatchError, GitLabPipelineError, AzurePipelineError) as exc:
             initial_status = "blocked"
             failure_code = exc.code
             failure_message = str(exc)
@@ -211,9 +248,9 @@ def create_build_run(
         service_id=service.id,
         requested_by=actor.id,
         attempt_number=attempt_number,
-        provider="github_actions",
+        provider=provider,
         repository_url=repository_url,
-        workflow_path=settings.github_actions_workflow_path,
+        workflow_path=workflow_path,
         source_ref=deployment.source_ref or deployment.version,
         status=initial_status,
         attempt_count=0,
@@ -230,7 +267,7 @@ def create_build_run(
         from_status=None,
         to_status=initial_status,
         message=(
-            "Build request queued for the configured GitHub Actions workflow."
+            f"Build request queued for the configured {_build_provider_label(provider)} workflow."
             if initial_status == "queued"
             else failure_message or "Build request is blocked by source configuration."
         ),
@@ -242,6 +279,145 @@ def create_build_run(
         },
     )
     return build_run
+
+
+def create_artifact_promotion_build_run(
+    db: Session,
+    deployment: Deployment,
+    source_build_run: BuildRun,
+    source_artifact: BuildArtifact,
+    *,
+    gitops_revision: str,
+    actor: User,
+) -> BuildRun:
+    """Attach immutable, previously verified evidence to a no-rebuild promotion run."""
+    attempt_number = (
+        db.scalar(
+            select(func.max(BuildRun.attempt_number)).where(BuildRun.deployment_id == deployment.id)
+        )
+        or 0
+    ) + 1
+    now = datetime.now(UTC)
+    build_run = BuildRun(
+        workspace_id=deployment.workspace_id,
+        deployment_id=deployment.id,
+        service_id=deployment.service_id,
+        requested_by=actor.id,
+        attempt_number=attempt_number,
+        provider="artifact_promotion",
+        repository_url=source_build_run.repository_url,
+        workflow_path=source_build_run.workflow_path,
+        source_ref=source_build_run.source_ref,
+        commit_sha=source_build_run.commit_sha,
+        gitops_revision=gitops_revision,
+        status="succeeded",
+        attempt_count=0,
+        max_attempts=1,
+        started_at=now,
+        finished_at=now,
+    )
+    db.add(build_run)
+    db.flush()
+    db.add(
+        BuildArtifact(
+            workspace_id=source_artifact.workspace_id,
+            build_run_id=build_run.id,
+            name=source_artifact.name,
+            artifact_type=source_artifact.artifact_type,
+            uri=source_artifact.uri,
+            digest=source_artifact.digest,
+            sbom_format=source_artifact.sbom_format,
+            sbom_uri=source_artifact.sbom_uri,
+            sbom_digest=source_artifact.sbom_digest,
+            vulnerability_uri=source_artifact.vulnerability_uri,
+            vulnerability_summary=dict(source_artifact.vulnerability_summary or {}),
+            vulnerability_report_digest=source_artifact.vulnerability_report_digest,
+            vulnerability_scanner_version=source_artifact.vulnerability_scanner_version,
+            signature_uri=source_artifact.signature_uri,
+            signer_identity=source_artifact.signer_identity,
+            oidc_issuer=source_artifact.oidc_issuer,
+            provenance_uri=source_artifact.provenance_uri,
+            provenance_digest=source_artifact.provenance_digest,
+            evidence_status=source_artifact.evidence_status,
+        )
+    )
+    db.flush()
+    append_build_event(
+        db,
+        build_run,
+        event_type="artifact.promoted",
+        from_status=None,
+        to_status="succeeded",
+        message=(
+            "Previously built artifact and its immutable evidence were promoted without rebuilding."
+        ),
+        actor=actor,
+        details={
+            "source_build_run_id": str(source_build_run.id),
+            "source_artifact_id": str(source_artifact.id),
+            "artifact_digest": source_artifact.digest,
+            "gitops_revision": gitops_revision,
+        },
+    )
+    return build_run
+
+
+def evaluate_artifact_policy_for_release(db: Session, deployment: Deployment, build_run: BuildRun):
+    """Evaluate artifact rules against immutable evidence for a release or promotion."""
+    service = db.get(Service, deployment.service_id)
+    environment = db.get(Environment, deployment.environment_id)
+    artifacts = list(
+        db.scalars(select(BuildArtifact).where(BuildArtifact.build_run_id == build_run.id)).all()
+    )
+    if service is None or environment is None or not artifacts:
+        raise ValueError("Artifact policy evaluation context is incomplete")
+    vulnerability_counts = {
+        severity: sum(int(item.vulnerability_summary.get(severity, 0)) for item in artifacts)
+        for severity in ("critical", "high", "medium", "low", "unknown")
+    }
+    policy_context = {
+        "service": {
+            "slug": service.slug,
+            "lifecycle": service.lifecycle,
+            "criticality": service.criticality,
+            "tags": service.tags,
+            "repository_url": service.repository_url,
+        },
+        "environment": {
+            "slug": environment.slug,
+            "type": environment.environment_type,
+            "protected": environment.protected,
+        },
+        "deployment": {"version": deployment.version, "source_ref": deployment.source_ref},
+        "artifact": {
+            "all_signed": all(
+                bool(item.signature_uri and item.signer_identity)
+                and (
+                    item.evidence_status == "verified"
+                    if settings.require_verified_supply_chain
+                    else True
+                )
+                for item in artifacts
+            ),
+            "all_have_sbom": all(bool(item.sbom_uri and item.sbom_digest) for item in artifacts),
+            "all_have_provenance": all(
+                bool(item.provenance_uri and item.provenance_digest and item.oidc_issuer)
+                for item in artifacts
+            ),
+            "critical_vulnerabilities": vulnerability_counts["critical"],
+            "high_vulnerabilities": vulnerability_counts["high"],
+        },
+    }
+    return evaluate_policy_set(
+        db,
+        workspace_id=deployment.workspace_id,
+        action="deployment",
+        context=policy_context,
+        subject_type="deployment",
+        subject_id=deployment.id,
+        service_id=service.id,
+        environment_id=environment.id,
+    )
 
 
 def verify_callback_signature(
@@ -268,10 +444,26 @@ def verify_callback_signature(
     return hmac.compare_digest(expected, supplied)
 
 
-def _same_repository(first: str, second: str) -> bool:
+def _parse_source_repository(repository_url: str, provider: str) -> tuple[str, ...]:
+    if provider == "github_actions":
+        return parse_github_repository(repository_url)
+    if provider == "gitlab_ci":
+        return (parse_gitlab_repository(repository_url, settings.gitlab_server_url),)
+    if provider == "azure_devops":
+        return parse_azure_repository(repository_url, settings.azure_devops_organization_url)
+    raise ValueError("Build provider is not supported for source repository URLs")
+
+
+def _same_repository(first: str, second: str, provider: str) -> bool:
     try:
-        return parse_github_repository(first) == parse_github_repository(second)
-    except GitHubDispatchError:
+        first_repository = _parse_source_repository(first, provider)
+        second_repository = _parse_source_repository(second, provider)
+        if provider == "azure_devops":
+            return tuple(part.casefold() for part in first_repository) == tuple(
+                part.casefold() for part in second_repository
+            )
+        return first_repository == second_repository
+    except (GitHubDispatchError, GitLabPipelineError, AzurePipelineError, ValueError):
         return False
 
 
@@ -282,10 +474,10 @@ def _ensure_deployment_building(db: Session, deployment: Deployment, build_run: 
             deployment,
             "building",
             event_type="build.dispatched",
-            message="GitHub Actions accepted the build workflow dispatch.",
+            message="The configured CI provider accepted the build dispatch.",
             actor_type="worker",
-            actor_id="github-actions-adapter",
-            details={"build_run_id": str(build_run.id)},
+            actor_id=f"{build_run.provider}-adapter",
+            details={"build_run_id": str(build_run.id), "provider": build_run.provider},
         )
 
 
@@ -307,7 +499,7 @@ def _fail_build_and_deployment(
         event_type=event_type,
         message=message,
         actor_type="system",
-        actor_id="github-actions-adapter",
+        actor_id=f"{build_run.provider}-adapter",
         delivery_id=delivery_id,
         details=details,
         failure_code=code,
@@ -323,7 +515,7 @@ def _fail_build_and_deployment(
             event_type="build.failed",
             message=message,
             actor_type="system",
-            actor_id="github-actions-adapter",
+            actor_id=f"{build_run.provider}-adapter",
             details={"build_run_id": str(build_run.id), "failure_code": code},
             failure_code=code,
             failure_message=message,
@@ -537,45 +729,75 @@ def _process_claimed_build_run(db: Session, build_run_id: UUID, worker_name: str
         )
         db.commit()
         return True
-    if not settings.github_actions_builds_configured:
+    provider_label = _build_provider_label(build_run.provider)
+    if not settings.build_provider_configured_for(build_run.provider):
+        if build_run.provider == "gitlab_ci":
+            required_settings = ["GITLAB_BUILD_TOKEN", "GITLAB_SERVER_URL", "GITLAB_API_URL"]
+            failure_code = "gitlab_ci_not_configured"
+        elif build_run.provider == "azure_devops":
+            required_settings = [
+                "AZURE_DEVOPS_BUILD_TOKEN",
+                "AZURE_DEVOPS_ORGANIZATION_URL",
+                "AZURE_DEVOPS_PIPELINE_IDS",
+                "BUILD_CALLBACK_PUBLIC_URL",
+            ]
+            failure_code = "azure_devops_not_configured"
+        else:
+            required_settings = ["GITHUB_ACTIONS_TOKEN"]
+            failure_code = "github_actions_not_configured"
         transition_build_run(
             db,
             build_run,
             "blocked",
             event_type="provider.not_configured",
             message=(
-                "GitHub Actions dispatch requires a repository token and an externally "
+                f"{provider_label} dispatch requires its worker credential and an externally "
                 "reachable HTTPS callback URL."
             ),
             actor_type="worker",
             actor_id=worker_name,
-            failure_code="github_actions_not_configured",
-            failure_message="Configure the GitHub Actions provider before retrying this build.",
-            details={
-                "required_settings": [
-                    "GITHUB_ACTIONS_TOKEN",
-                    "BUILD_CALLBACK_PUBLIC_URL",
-                ]
-            },
+            failure_code=failure_code,
+            failure_message=f"Configure the {provider_label} provider before retrying this build.",
+            details={"required_settings": [*required_settings, "BUILD_CALLBACK_PUBLIC_URL"]},
         )
         db.commit()
         return True
 
-    token = settings.github_actions_token.get_secret_value()
-    config = DispatchConfiguration(
-        token=token,
-        api_url=settings.github_api_url,
-        callback_url=settings.build_callback_public_url,
-    )
-    workflow_path = build_run.workflow_path
+    dispatch_result = None
     db.commit()  # Release the read transaction before the network request.
     try:
-        dispatch_workflow(
-            build_run,
-            config,
-            workflow_path=workflow_path,
-        )
-    except GitHubDispatchError as exc:
+        if build_run.provider == "github_actions":
+            token = settings.github_actions_token.get_secret_value()
+            config = DispatchConfiguration(
+                token=token,
+                api_url=settings.github_api_url,
+                callback_url=settings.build_callback_public_url,
+            )
+            dispatch_workflow(build_run, config, workflow_path=build_run.workflow_path)
+        elif build_run.provider == "gitlab_ci":
+            token = settings.gitlab_build_token.get_secret_value()
+            config = GitLabPipelineConfiguration(
+                token=token,
+                api_url=settings.gitlab_api_url,
+                server_url=settings.gitlab_server_url,
+                callback_url=settings.build_callback_public_url,
+            )
+            dispatch_result = dispatch_pipeline(build_run, config)
+        elif build_run.provider == "azure_devops":
+            token = settings.azure_devops_build_token.get_secret_value()
+            config = AzurePipelineConfiguration(
+                token=token,
+                organization_url=settings.azure_devops_organization_url,
+                oidc_issuer=settings.azure_devops_oidc_issuer,
+                pipeline_bindings=settings.azure_devops_pipeline_map,
+                callback_url=settings.build_callback_public_url,
+            )
+            dispatch_result = dispatch_azure_pipeline(build_run, config)
+        else:
+            raise GitHubDispatchError(
+                "unsupported_build_provider", "The configured CI provider is not supported."
+            )
+    except (GitHubDispatchError, GitLabPipelineError, AzurePipelineError) as exc:
         db.refresh(build_run)
         if build_run.status != "dispatching":
             return True  # A signed runner callback won the race with the HTTP response.
@@ -586,7 +808,7 @@ def _process_claimed_build_run(db: Session, build_run_id: UUID, worker_name: str
                 build_run,
                 "queued",
                 event_type="dispatch.retry_scheduled",
-                message="GitHub dispatch was temporarily unavailable; retry scheduled.",
+                message=f"{provider_label} dispatch was temporarily unavailable; retry scheduled.",
                 actor_type="worker",
                 actor_id=worker_name,
                 details={"failure_code": exc.code, "retry_after_seconds": delay},
@@ -615,12 +837,15 @@ def _process_claimed_build_run(db: Session, build_run_id: UUID, worker_name: str
             "dispatched",
             event_type="dispatched",
             message=(
-                "GitHub Actions accepted the workflow dispatch; waiting for signed build callbacks."
+                f"{provider_label} accepted the pipeline; waiting for authenticated "
+                "build callbacks."
             ),
             actor_type="worker",
             actor_id=worker_name,
             callback_deadline_at=datetime.now(UTC)
             + timedelta(seconds=settings.build_callback_timeout_seconds),
+            external_run_id=(dispatch_result.external_run_id if dispatch_result else None),
+            run_url=(dispatch_result.run_url if dispatch_result else None),
         )
         _ensure_deployment_building(db, deployment, build_run)
         db.commit()
@@ -653,14 +878,14 @@ def apply_build_callback(
     )
     if previous_delivery is not None:
         return False
-    if not _same_repository(payload.repository_url, build_run.repository_url):
+    if not _same_repository(payload.repository_url, build_run.repository_url, build_run.provider):
         raise ValueError("Callback repository does not match the registered source repository")
     try:
-        parse_github_repository(payload.repository_url)
-    except GitHubDispatchError as exc:
+        _parse_source_repository(payload.repository_url, build_run.provider)
+    except (GitHubDispatchError, GitLabPipelineError, AzurePipelineError, ValueError) as exc:
         raise ValueError(str(exc)) from exc
     if build_run.external_run_id and payload.external_run_id != build_run.external_run_id:
-        raise ValueError("Callback run ID does not match the dispatched GitHub run")
+        raise ValueError("Callback run ID does not match the dispatched CI pipeline")
     if build_run.commit_sha and build_run.commit_sha != payload.commit_sha:
         raise ValueError(
             "Callback commit does not match the commit already recorded for this build"
@@ -687,14 +912,15 @@ def apply_build_callback(
         raise ValueError("Associated deployment no longer exists")
 
     if payload.status == "running":
+        provider_label = _build_provider_label(build_run.provider)
         if build_run.status != "running":
             transition_build_run(
                 db,
                 build_run,
                 "running",
                 event_type="callback.running",
-                message="GitHub Actions runner started the build workflow.",
-                actor_type="github_actions",
+                message=f"{provider_label} runner started the build workflow.",
+                actor_type=build_run.provider,
                 actor_id=payload.external_run_id,
                 delivery_id=payload.delivery_id,
                 details={
@@ -714,8 +940,8 @@ def apply_build_callback(
                 event_type="callback.heartbeat",
                 from_status="running",
                 to_status="running",
-                message="GitHub Actions runner sent a workflow heartbeat.",
-                actor_type="github_actions",
+                message=f"{provider_label} runner sent a workflow heartbeat.",
+                actor_type=build_run.provider,
                 actor_id=payload.external_run_id,
                 delivery_id=payload.delivery_id,
                 details={"commit_sha": payload.commit_sha},
@@ -748,7 +974,10 @@ def apply_build_callback(
                     sbom_format=evidence.sbom_format,
                     sbom_uri=evidence.sbom_uri,
                     sbom_digest=evidence.sbom_digest,
+                    vulnerability_uri=evidence.vulnerability_uri,
                     vulnerability_summary=evidence.vulnerability_summary.model_dump(),
+                    vulnerability_report_digest=evidence.vulnerability_report_digest,
+                    vulnerability_scanner_version=evidence.vulnerability_scanner_version,
                     signature_uri=evidence.signature_uri,
                     signer_identity=evidence.signer_identity,
                     oidc_issuer=evidence.oidc_issuer,
@@ -770,12 +999,19 @@ def apply_build_callback(
         for severity in ("critical", "high", "medium", "low", "unknown")
     }
     if payload.status == "failed":
-        message = payload.failure_message or "GitHub Actions reported a build failure."
+        provider_label = _build_provider_label(build_run.provider)
+        message = payload.failure_message or f"{provider_label} reported a build failure."
         _fail_build_and_deployment(
             db,
             build_run,
             deployment,
-            code="github_workflow_failed",
+            code=(
+                "gitlab_pipeline_failed"
+                if build_run.provider == "gitlab_ci"
+                else "azure_pipeline_failed"
+                if build_run.provider == "azure_devops"
+                else "github_workflow_failed"
+            ),
             message=message,
             event_type="callback.failed",
             delivery_id=payload.delivery_id,
@@ -840,7 +1076,7 @@ def apply_build_callback(
                 "and provenance evidence."
             )
         ),
-        actor_type="github_actions",
+        actor_type=build_run.provider,
         actor_id=payload.external_run_id,
         delivery_id=payload.delivery_id,
         details={
@@ -966,7 +1202,7 @@ def apply_build_callback(
             event_type="build.succeeded",
             message="Artifact build completed; release is ready for GitOps deployment.",
             actor_type="system",
-            actor_id="github-actions-adapter",
+            actor_id=f"{build_run.provider}-adapter",
             details={
                 "build_run_id": str(build_run.id),
                 "commit_sha": payload.commit_sha,

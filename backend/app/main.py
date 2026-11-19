@@ -8,7 +8,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
+from prometheus_client import CONTENT_TYPE_LATEST
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.sessions import SessionMiddleware
 
@@ -16,8 +17,9 @@ from app.api.v1.endpoints import scim
 from app.api.v1.router import api_router
 from app.core.config import settings
 from app.core.logging import configure_logging
+from app.core.metrics import generate_metrics, observe_http_request, refresh_platform_metrics
 from app.core.telemetry import configure_telemetry
-from app.db.session import engine
+from app.db.session import SessionLocal, engine
 
 configure_logging()
 logger = logging.getLogger("deployforge.api")
@@ -71,6 +73,13 @@ async def request_logging(request: Request, call_next):
     response = await call_next(request)
     status_code = response.status_code if response.status_code is not None else 500
     elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
+    route = request.scope.get("route")
+    observe_http_request(
+        request.method,
+        getattr(route, "path", "unmatched"),
+        status_code,
+        elapsed_ms / 1000,
+    )
     response.headers["X-Request-ID"] = request_id
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
@@ -148,3 +157,10 @@ def root() -> dict[str, str]:
 
 app.include_router(api_router, prefix="/api/v1")
 app.include_router(scim.router, prefix="/scim/v2")
+
+
+@app.get("/metrics", include_in_schema=False)
+def prometheus_metrics() -> Response:
+    with SessionLocal() as db:
+        refresh_platform_metrics(db)
+    return Response(content=generate_metrics(), media_type=CONTENT_TYPE_LATEST)

@@ -21,7 +21,13 @@ from app.core.supply_chain import (
     SupplyChainVerificationUnavailable,
     verify_callback_evidence,
 )
+from app.integrations.azure_devops import (
+    AzurePipelineError,
+    azure_pipeline_reference,
+    pipeline_binding_for_repository,
+)
 from app.integrations.github_actions import GitHubDispatchError, parse_github_repository
+from app.integrations.gitlab_ci import GitLabPipelineError, parse_gitlab_repository
 from app.models import BuildRun, BuildRunEvent, User, UserSession
 from app.schemas.core import BuildCallbackRequest, BuildRunContract, BuildRunDetail
 
@@ -110,13 +116,35 @@ def retry_blocked_build_run(
     build_run = _load_build_run(db, workspace_id, build_run_id)
     if build_run.status != "blocked":
         raise HTTPException(status_code=409, detail="Only blocked build runs can be retried here")
-    if not settings.github_actions_builds_configured:
-        raise HTTPException(status_code=409, detail="GitHub Actions integration is not configured")
+    if not settings.build_provider_available_for(build_run.provider):
+        raise HTTPException(status_code=409, detail="The build provider is not configured")
+    azure_pipeline_id: int | None = None
     try:
-        parse_github_repository(build_run.repository_url or "")
-    except GitHubDispatchError as exc:
+        if build_run.provider == "gitlab_ci":
+            parse_gitlab_repository(build_run.repository_url or "", settings.gitlab_server_url)
+        elif build_run.provider == "azure_devops":
+            binding = pipeline_binding_for_repository(
+                build_run.repository_url or "",
+                settings.azure_devops_organization_url,
+                settings.azure_devops_pipeline_map,
+            )
+            azure_pipeline_id = binding.pipeline_id
+            pinned_reference = azure_pipeline_reference(binding)
+            if build_run.workflow_path == "azure-pipeline:unmapped":
+                build_run.workflow_path = pinned_reference
+            elif build_run.workflow_path != pinned_reference:
+                raise AzurePipelineError(
+                    "azure_pipeline_mapping_changed",
+                    "The configured Azure pipeline no longer matches this build.",
+                )
+        else:
+            parse_github_repository(build_run.repository_url or "")
+    except (GitHubDispatchError, GitLabPipelineError, AzurePipelineError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     try:
+        retry_details = {"previous_failure_code": build_run.failure_code}
+        if azure_pipeline_id is not None:
+            retry_details["azure_pipeline_id"] = azure_pipeline_id
         transition_build_run(
             db,
             build_run,
@@ -124,7 +152,7 @@ def retry_blocked_build_run(
             event_type="retry.requested",
             message="Build run returned to the durable dispatch queue.",
             actor=actor,
-            details={"previous_failure_code": build_run.failure_code},
+            details=retry_details,
         )
     except BuildRunTransitionConflict as exc:
         db.rollback()
@@ -137,7 +165,7 @@ def retry_blocked_build_run(
 @router.post(
     "/build-runs/{build_run_id}/callback",
     response_model=BuildRunContract,
-    summary="Receive an authenticated CI workflow update and supply-chain evidence",
+    summary="Receive an authenticated CI build update and supply-chain evidence",
 )
 async def receive_build_callback(
     build_run_id: UUID,
@@ -192,8 +220,7 @@ async def receive_build_callback(
             raise HTTPException(
                 status_code=503,
                 detail=(
-                    "Signed evidence verification is temporarily unavailable; "
-                    "retry the callback"
+                    "Signed evidence verification is temporarily unavailable; retry the callback"
                 ),
                 headers={"Retry-After": "30"},
             ) from exc
