@@ -427,6 +427,7 @@ def list_slo_alerts(
         pattern="^(firing|acknowledged|resolved)$",
     ),
     limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     identity: tuple[User, UserSession] = Depends(get_current_identity),
     db: Session = Depends(get_db),
 ) -> list[SloAlert]:
@@ -434,7 +435,13 @@ def list_slo_alerts(
     query = select(SloAlert).where(SloAlert.workspace_id == workspace_id)
     if status_filter:
         query = query.where(SloAlert.status == status_filter)
-    return list(db.scalars(query.order_by(SloAlert.created_at.desc()).limit(limit)).all())
+    return list(
+        db.scalars(
+            query.order_by(SloAlert.created_at.desc(), SloAlert.id.desc())
+            .limit(limit)
+            .offset(offset)
+        ).all()
+    )
 
 
 @router.post(

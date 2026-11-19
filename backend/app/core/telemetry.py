@@ -72,7 +72,7 @@ def configure_telemetry(
             tracer_provider=trace_provider,
             meter_provider=meter_provider,
             excluded_urls=(
-                r"/api/v1/health/(live|ready),/api/v1/system/status,"
+                r"/api/v1/health/(live|ready),/api/v1/system/status,/metrics,"
                 r"/api/v1/auth/(login|callback)"
             ),
         )
