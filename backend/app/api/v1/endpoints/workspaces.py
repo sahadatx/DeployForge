@@ -11,6 +11,7 @@ from app.core.audit import record_audit
 from app.core.authorization import require_workspace_access
 from app.models import Environment, User, UserSession, Workspace, WorkspaceMembership
 from app.schemas.core import (
+    DeploymentFreezeRequest,
     EnvironmentContract,
     EnvironmentCreate,
     EnvironmentPatch,
@@ -270,6 +271,95 @@ def patch_environment(
     return environment
 
 
+@router.post(
+    "/{workspace_id}/environments/{environment_id}/deployment-freeze",
+    response_model=EnvironmentContract,
+    summary="Schedule an audited deployment freeze window",
+)
+def set_environment_deployment_freeze(
+    workspace_id: UUID,
+    environment_id: UUID,
+    payload: DeploymentFreezeRequest,
+    identity: tuple[User, UserSession] = Depends(require_csrf),
+    db: Session = Depends(get_db),
+) -> Environment:
+    actor = identity[0]
+    require_workspace_access(db, actor, workspace_id, roles=ENVIRONMENT_WRITER_ROLES)
+    environment = db.scalar(
+        select(Environment).where(
+            Environment.workspace_id == workspace_id,
+            Environment.id == environment_id,
+        )
+    )
+    if environment is None:
+        raise HTTPException(status_code=404, detail="Environment not found")
+    environment.deployment_freeze_start_at = payload.starts_at
+    environment.deployment_freeze_until = payload.ends_at
+    environment.deployment_freeze_reason = payload.reason
+    record_audit(
+        db,
+        actor=actor,
+        action="environment.deployment_freeze.scheduled",
+        resource_type="environment",
+        resource_id=environment.id,
+        workspace_id=workspace_id,
+        details={
+            "starts_at": payload.starts_at.isoformat(),
+            "ends_at": payload.ends_at.isoformat(),
+            "reason": payload.reason,
+        },
+    )
+    db.commit()
+    db.refresh(environment)
+    return environment
+
+
+@router.delete(
+    "/{workspace_id}/environments/{environment_id}/deployment-freeze",
+    response_model=EnvironmentContract,
+    summary="Cancel an environment deployment freeze",
+)
+def clear_environment_deployment_freeze(
+    workspace_id: UUID,
+    environment_id: UUID,
+    identity: tuple[User, UserSession] = Depends(require_csrf),
+    db: Session = Depends(get_db),
+) -> Environment:
+    actor = identity[0]
+    require_workspace_access(db, actor, workspace_id, roles=ENVIRONMENT_WRITER_ROLES)
+    environment = db.scalar(
+        select(Environment).where(
+            Environment.workspace_id == workspace_id,
+            Environment.id == environment_id,
+        )
+    )
+    if environment is None:
+        raise HTTPException(status_code=404, detail="Environment not found")
+    if environment.deployment_freeze_start_at is None:
+        raise HTTPException(status_code=409, detail="This environment has no scheduled freeze")
+    previous = {
+        "starts_at": environment.deployment_freeze_start_at.isoformat(),
+        "ends_at": environment.deployment_freeze_until.isoformat()
+        if environment.deployment_freeze_until
+        else None,
+    }
+    environment.deployment_freeze_start_at = None
+    environment.deployment_freeze_until = None
+    environment.deployment_freeze_reason = None
+    record_audit(
+        db,
+        actor=actor,
+        action="environment.deployment_freeze.canceled",
+        resource_type="environment",
+        resource_id=environment.id,
+        workspace_id=workspace_id,
+        details=previous,
+    )
+    db.commit()
+    db.refresh(environment)
+    return environment
+
+
 @router.get(
     "/{workspace_id}/members",
     response_model=list[WorkspaceMemberContract],
@@ -291,9 +381,9 @@ def list_members(
             "membership_id": membership.id,
             "user": membership.user,
             "role": membership.role,
+            "created_at": membership.created_at,
             "identity_source": membership.identity_source,
             "identity_groups": membership.identity_groups or [],
-            "created_at": membership.created_at,
         }
         for membership in memberships
     ]
@@ -368,9 +458,9 @@ def create_member(
         "membership_id": membership.id,
         "user": user,
         "role": membership.role,
+        "created_at": membership.created_at,
         "identity_source": membership.identity_source,
         "identity_groups": membership.identity_groups or [],
-        "created_at": membership.created_at,
     }
 
 
@@ -417,7 +507,9 @@ def update_member(
     if membership.identity_source in {"idp", "scim"}:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="This workspace role is managed by the identity provider",
+            detail=(
+                "This role is identity-managed; update its mapped group instead"
+            ),
         )
     if membership.role == "workspace_admin" and payload.role != "workspace_admin":
         admin_count = (
@@ -457,9 +549,9 @@ def update_member(
         "membership_id": membership.id,
         "user": membership.user,
         "role": membership.role,
+        "created_at": membership.created_at,
         "identity_source": membership.identity_source,
         "identity_groups": membership.identity_groups or [],
-        "created_at": membership.created_at,
     }
 
 
@@ -489,7 +581,9 @@ def delete_member(
     if membership.identity_source in {"idp", "scim"}:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="This workspace role is managed by the identity provider",
+            detail=(
+                "This role is identity-managed; remove the mapped group to revoke it"
+            ),
         )
     if membership.role == "workspace_admin":
         admin_count = (

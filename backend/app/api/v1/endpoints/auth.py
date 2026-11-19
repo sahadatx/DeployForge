@@ -1,14 +1,13 @@
 import logging
 import secrets
 from datetime import UTC, datetime, timedelta
-from typing import Any
 from urllib.parse import urljoin
 
 from authlib.integrations.base_client.errors import OAuthError
 from authlib.integrations.starlette_client import OAuth
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import RedirectResponse
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, SecretStr
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -16,7 +15,8 @@ from app.api.deps import get_current_identity, get_db, hash_session_token, requi
 from app.core.audit import record_audit
 from app.core.config import settings
 from app.core.identity_admin import sync_oidc_admin_allowlist
-from app.core.oidc_group_sync import sync_oidc_group_memberships
+from app.core.identity_sync import scim_group_names, sync_group_memberships
+from app.core.local_passwords import LOCAL_ISSUER, local_login_limiter, verify_password
 from app.models import User, UserSession, WorkspaceMembership
 from app.schemas.core import AuthSessionContract, UserContract
 
@@ -27,8 +27,10 @@ _oidc_registered = False
 
 
 class DevelopmentLoginRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     email: EmailStr
-    display_name: str | None = Field(default=None, min_length=1, max_length=180)
+    password: SecretStr = Field(min_length=1, max_length=128)
 
 
 def _register_oidc_client():
@@ -84,7 +86,7 @@ def _frontend_redirect(path: str) -> RedirectResponse:
     )
 
 
-def _membership_payload(db: Session, user: User) -> list[dict[str, Any]]:
+def _membership_payload(db: Session, user: User) -> list[dict[str, str]]:
     memberships = db.scalars(
         select(WorkspaceMembership)
         .where(WorkspaceMembership.user_id == user.id)
@@ -94,8 +96,6 @@ def _membership_payload(db: Session, user: User) -> list[dict[str, Any]]:
         {
             "workspace_id": str(membership.workspace_id),
             "role": membership.role,
-            "identity_source": membership.identity_source,
-            "identity_groups": membership.identity_groups or [],
         }
         for membership in memberships
     ]
@@ -123,6 +123,7 @@ def auth_config() -> dict[str, bool | str]:
     )
     return {
         "oidc_enabled": settings.oidc_configured,
+        "scim_enabled": settings.scim_bearer_token is not None,
         "development_login_enabled": dev_enabled,
         "authentication_required": True,
     }
@@ -148,77 +149,63 @@ async def oidc_callback(request: Request, db: Session = Depends(get_db)):
         issuer = str(claims.get("iss", "")).strip()
         email = str(claims.get("email", "")).strip().casefold()
         email_verified = claims.get("email_verified") is True
-        external_id_claim = claims.get(settings.oidc_scim_external_id_claim)
-        if external_id_claim is not None and not isinstance(external_id_claim, str):
-            raise ValueError("OIDC SCIM external ID claim must be a string")
-        scim_external_id = (external_id_claim or "").strip()
-        if len(scim_external_id) > 255:
-            raise ValueError("OIDC SCIM external ID claim exceeds 255 characters")
-
-        group_claim_present = settings.oidc_group_claim in claims
-        group_claim = claims.get(settings.oidc_group_claim)
-        if group_claim is None and group_claim_present:
-            raise ValueError("OIDC group claim must be a list of group names")
-        if group_claim is None:
-            group_names: list[str] = []
-        elif not isinstance(group_claim, list) or any(
-            not isinstance(group, str) or len(group) > 180 for group in group_claim
-        ):
-            raise ValueError("OIDC group claim must be a list of group names")
-        else:
-            group_names = group_claim
-        if not subject or not issuer or not email or not email_verified:
+        scim_external_id = str(
+            claims.get(settings.oidc_scim_external_id_claim, "") or ""
+        ).strip()
+        if not subject or len(subject) > 255 or not issuer or not email or not email_verified:
             raise ValueError("OIDC identity is missing verified account claims")
 
         user = db.scalar(select(User).where(User.issuer == issuer, User.subject == subject))
-        if user is None and scim_external_id:
-            user = db.scalar(select(User).where(User.scim_external_id == scim_external_id))
-            if user is not None and user.active:
-                conflicting_email = db.scalar(
-                    select(User).where(func.lower(User.email) == email, User.id != user.id)
-                )
-                if conflicting_email is not None:
-                    raise ValueError("SCIM identity email conflicts with another account")
-                user.issuer = issuer
-                user.subject = subject
-                user.email = email
-                user.display_name = str(claims.get("name") or user.display_name)[:180]
-                user.email_verified = True
-                record_audit(
-                    db,
-                    actor=user,
-                    action="identity.scim_account.linked",
-                    resource_type="user",
-                    resource_id=user.id,
-                    details={"method": "verified_oidc_external_id"},
-                )
-
         if user is None:
-            email_owner = db.scalar(select(User).where(func.lower(User.email) == email))
-            if email_owner is not None:
-                record_audit(
-                    db,
-                    action="authentication.account_link.rejected",
-                    resource_type="user",
-                    resource_id=email_owner.id,
-                    outcome="denied",
-                    details={"reason": "existing_email_has_different_identity"},
+            if scim_external_id:
+                user = db.scalar(select(User).where(User.scim_external_id == scim_external_id))
+                if user is not None:
+                    conflicting_email = db.scalar(
+                        select(User).where(func.lower(User.email) == email, User.id != user.id)
+                    )
+                    if conflicting_email is not None:
+                        raise ValueError("SCIM identity email conflicts with another account")
+                    user.issuer = issuer
+                    user.subject = subject
+                    user.email = email
+                    user.email_verified = True
+                    user.display_name = str(claims.get("name") or user.display_name)[:180]
+                    record_audit(
+                        db,
+                        actor=user,
+                        action="identity.scim_account.linked",
+                        resource_type="user",
+                        resource_id=user.id,
+                        details={"method": "verified_oidc_external_id"},
+                    )
+            if user is None:
+                email_owner = db.scalar(select(User).where(func.lower(User.email) == email))
+                if email_owner is not None:
+                    record_audit(
+                        db,
+                        action="authentication.account_link.rejected",
+                        resource_type="user",
+                        resource_id=email_owner.id,
+                        outcome="denied",
+                        details={"reason": "existing_email_has_different_identity"},
+                    )
+                    db.commit()
+                    return _frontend_redirect("/login?error=account_link")
+                user = User(
+                    issuer=issuer,
+                    subject=subject,
+                    email=email,
+                    display_name=str(claims.get("name") or email.split("@", 1)[0])[:180],
+                    email_verified=True,
                 )
-                db.commit()
-                return _frontend_redirect("/login?error=account_link")
-            user = User(
-                issuer=issuer,
-                subject=subject,
-                email=email,
-                display_name=str(claims.get("name") or email.split("@", 1)[0])[:180],
-                email_verified=True,
-            )
-            db.add(user)
-            db.flush()
-        elif user.active:
+                db.add(user)
+                db.flush()
+        else:
             user.email = email
             user.display_name = str(claims.get("name") or user.display_name)[:180]
             user.email_verified = True
+
+        sync_oidc_admin_allowlist(db, user)
 
         if not user.active:
             record_audit(
@@ -233,17 +220,25 @@ async def oidc_callback(request: Request, db: Session = Depends(get_db)):
             db.commit()
             return _frontend_redirect("/login?error=account_disabled")
 
-        sync_oidc_admin_allowlist(db, user)
+        group_claim = claims.get(settings.oidc_group_claim)
+        if group_claim is None:
+            group_claim = scim_group_names(db, user)
+            if not group_claim and settings.oidc_group_role_map:
+                sync_group_memberships(db, user, [])
+        elif not isinstance(group_claim, list) or any(
+            not isinstance(group, str) for group in group_claim
+        ):
+            raise ValueError("OIDC group claim must be a list of group names")
+        if group_claim:
+            sync_group_memberships(db, user, group_claim)
+        elif settings.oidc_group_claim in claims:
+            sync_group_memberships(db, user, [])
 
-        if not group_claim_present and settings.oidc_group_role_map and not user.scim_external_id:
-            raise ValueError("Configured OIDC group claim was not returned")
-        sync_oidc_group_memberships(db, user, group_names)
         raw_token, _session = _finish_login(db, user, method="oidc")
         response = _frontend_redirect("/overview")
         _set_session_cookie(response, raw_token)
         return response
     except (OAuthError, ValueError, KeyError) as exc:
-        db.rollback()
         logger.info("oidc_authentication_rejected", extra={"reason": type(exc).__name__})
         record_audit(
             db,
@@ -256,7 +251,8 @@ async def oidc_callback(request: Request, db: Session = Depends(get_db)):
         return _frontend_redirect("/login?error=identity_provider")
 
 
-@router.post("/dev-login", summary="Create a development-only local session")
+@router.post("/dev-login", deprecated=True, summary="Legacy local password login alias")
+@router.post("/password-login", summary="Sign in to an operator-provisioned local account")
 def development_login(
     payload: DevelopmentLoginRequest,
     request: Request,
@@ -284,52 +280,42 @@ def development_login(
         )
 
     email = str(payload.email).casefold()
-    user = db.scalar(
-        select(User).where(User.issuer == "urn:deployforge:development", User.subject == email)
+    retry_after = local_login_limiter.reserve(
+        email, request.client.host if request.client else "unknown"
     )
-    if user is None:
-        existing_count = db.scalar(select(func.count()).select_from(User)) or 0
-        auto_admin = settings.dev_auth_auto_admin_first_user and existing_count == 0
-        user = User(
-            issuer="urn:deployforge:development",
-            subject=email,
-            email=email,
-            display_name=payload.display_name or email.split("@", 1)[0],
-            email_verified=True,
-            is_platform_admin=auto_admin,
+    if retry_after:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many sign-in attempts. Try again later.",
+            headers={"Retry-After": str(retry_after)},
         )
-        db.add(user)
-        db.flush()
-        if auto_admin:
-            record_audit(
-                db,
-                actor=user,
-                action="identity.platform_admin.bootstrapped",
-                resource_type="user",
-                resource_id=user.id,
-                details={"method": "first_development_user"},
-            )
-    elif not user.active:
+    user = db.scalar(
+        select(User).where(User.issuer == LOCAL_ISSUER, func.lower(User.email) == email)
+    )
+    valid_password = verify_password(
+        payload.password.get_secret_value(), user.password_hash if user else None
+    )
+    if user is None or not user.active or not valid_password:
         record_audit(
             db,
-            actor=user,
             action="authentication.login.denied",
-            resource_type="user",
-            resource_id=user.id,
+            resource_type="identity_provider",
             outcome="denied",
-            details={"method": "development", "reason": "account_inactive"},
+            details={"method": "development_password", "reason": "invalid_credentials"},
         )
         db.commit()
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account is unavailable")
-    else:
-        user.display_name = payload.display_name or user.display_name
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Email or password is incorrect"
+        )
 
-    raw_token, session = _finish_login(db, user, method="development")
+    local_login_limiter.succeeded(email)
+    # A local password does not verify ownership of this email address.
+    user.email_verified = False
+    raw_token, session = _finish_login(db, user, method="development_password")
     _set_session_cookie(response, raw_token)
-    memberships = _membership_payload(db, user)
     return AuthSessionContract(
         user=UserContract.model_validate(user),
-        memberships=memberships,
+        memberships=_membership_payload(db, user),
         csrf_token=session.csrf_token,
     )
 

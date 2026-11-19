@@ -5,7 +5,41 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.audit import record_audit
+from app.core.config import settings
 from app.models import User, Workspace, WorkspaceMembership
+
+DEVELOPMENT_IDENTITY_ISSUER = "urn:deployforge:development"
+
+
+def require_verified_approval_identity(
+    db: Session,
+    user: User,
+    *,
+    workspace_id: UUID,
+    resource_type: str,
+    resource_id: UUID,
+) -> None:
+    """Require a verified external identity for approvals in staging/production."""
+    if not settings.verified_approval_identity_required:
+        return
+    if user.email_verified and user.issuer != DEVELOPMENT_IDENTITY_ISSUER:
+        return
+
+    record_audit(
+        db,
+        actor=user,
+        action="authorization.approval_identity.denied",
+        resource_type=resource_type,
+        resource_id=resource_id,
+        workspace_id=workspace_id,
+        outcome="denied",
+        details={"reason": "verified_identity_required"},
+    )
+    db.commit()
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="A verified organization sign-in is required to approve this operation",
+    )
 
 
 def require_workspace_access(
