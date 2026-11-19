@@ -137,6 +137,10 @@ export function apiPost<T>(path: string, body?: unknown) {
   return apiWrite<T>(path, "POST", body);
 }
 
+export function apiPut<T>(path: string, body: unknown) {
+  return apiWrite<T>(path, "PUT", body);
+}
+
 export function apiPatch<T>(path: string, body: unknown) {
   return apiWrite<T>(path, "PATCH", body);
 }
@@ -169,6 +173,9 @@ export type Environment = {
   quota_pods: number | null;
   quota_persistent_volume_claims: number | null;
   quota_services: number | null;
+  deployment_freeze_start_at: string | null;
+  deployment_freeze_until: string | null;
+  deployment_freeze_reason: string | null;
   created_at: string;
 };
 
@@ -193,8 +200,6 @@ export type User = {
 export type WorkspaceMembership = {
   workspace_id: string;
   role: "workspace_admin" | "platform_engineer" | "service_owner" | "auditor" | "platform_admin";
-  identity_source: "manual" | "idp" | "scim";
-  identity_groups: string[];
 };
 
 export type AuthSession = {
@@ -213,9 +218,9 @@ export type WorkspaceMember = {
   membership_id: string;
   user: User;
   role: "workspace_admin" | "platform_engineer" | "service_owner" | "auditor";
-  identity_source: "manual" | "idp" | "scim";
-  identity_groups: string[];
   created_at: string;
+  identity_source?: "manual" | "idp" | "scim";
+  identity_groups?: string[];
 };
 
 export type AuditEvent = {
@@ -284,6 +289,32 @@ export type GoldenPath = {
     options?: string[];
   }>;
   defaults: Record<string, unknown>;
+  repository_bootstrap_available: boolean;
+};
+
+export type GitHubRepositoryProvisioning = {
+  id: string;
+  workspace_id: string;
+  service_id: string;
+  requested_by: string | null;
+  golden_path_slug: string;
+  repository_owner: string;
+  repository_name: string;
+  template_owner: string;
+  template_name: string;
+  is_private: boolean;
+  status: "queued" | "dispatching" | "succeeded" | "blocked" | string;
+  attempt_count: number;
+  max_attempts: number;
+  external_repository_id: string | null;
+  repository_url: string | null;
+  default_branch: string | null;
+  failure_code: string | null;
+  failure_message: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  created_at: string;
+  updated_at: string;
 };
 
 export type ServiceCatalog = {
@@ -307,6 +338,8 @@ export type Deployment = {
   environment_id: string;
   version: string;
   source_ref: string | null;
+  promoted_artifact_id: string | null;
+  promotion_gitops_revision: string | null;
   status: string;
   requested_by: string | null;
   idempotency_key: string | null;
@@ -320,6 +353,22 @@ export type Deployment = {
   failure_message: string | null;
   created_at: string;
   updated_at: string;
+};
+
+export type PromotableArtifact = {
+  id: string;
+  name: string;
+  uri: string;
+  digest: string;
+  artifact_type: string;
+  evidence_status: string;
+  source_build_run_id: string;
+  source_deployment_id: string;
+  source_environment_id: string;
+  source_version: string;
+  source_ref: string;
+  commit_sha: string | null;
+  created_at: string;
 };
 
 export type DeploymentEvent = {
@@ -369,8 +418,10 @@ export type GitOpsTarget = {
   service_id: string;
   environment_id: string;
   application_name: string;
+  provider: "argocd" | "flux";
   expected_project: string;
   expected_cluster_name: string | null;
+  reconciliation_namespace: string | null;
   artifact_name: string | null;
   enabled: boolean;
   created_at: string;
@@ -397,6 +448,8 @@ export type GitOpsRun = {
   operation_phase: string | null;
   destination_name: string | null;
   destination_server: string | null;
+  rollout_snapshot: RolloutSnapshot | null;
+  rollout_updated_at: string | null;
   attempt_count: number;
   max_attempts: number;
   callback_deadline_at: string | null;
@@ -408,8 +461,79 @@ export type GitOpsRun = {
   updated_at: string;
 };
 
-export type ArgoApplicationStatus = {
+export type RolloutSnapshot = {
+  name: string | null;
+  namespace: string | null;
+  phase: string | null;
+  message: string | null;
+  paused: boolean;
+  current_step_index: number | null;
+  step_count: number;
+  current_step: {
+    set_weight: number | null;
+    pause_duration: string | null;
+    pause_conditions: Array<{ reason: string | null; start_time: string | null }>;
+  };
+  replicas: { replicas: number | null; updated: number | null; ready: number | null; available: number | null };
+  analysis_runs: Array<{
+    name: string | null;
+    phase: string | null;
+    message: string | null;
+    started_at: string | null;
+    finished_at: string | null;
+    metrics: Array<{
+      name: string | null;
+      phase: string | null;
+      count: number | null;
+      measurements: Array<{
+        phase: string | null;
+        value: string | null;
+        count: number | null;
+        message: string | null;
+        started_at: string | null;
+        finished_at: string | null;
+      }>;
+    }>;
+  }>;
+  observation_error?: string;
+};
+
+export type GitOpsRolloutAction = {
+  id: string;
+  gitops_run_id: string;
+  workspace_id: string;
+  requested_by: string | null;
+  action: "promote" | "abort";
+  status: string;
+  comment: string;
+  requested_step: string | null;
+  requested_rollout_status: string | null;
+  attempt_count: number;
+  failure_code: string | null;
+  failure_message: string | null;
+  dispatched_at: string | null;
+  completed_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type GitOpsRunDetail = GitOpsRun & {
+  events: Array<{
+    id: string;
+    sequence: number;
+    event_type: string;
+    actor_type: string;
+    actor_id: string | null;
+    message: string;
+    details: Record<string, unknown>;
+    created_at: string;
+  }>;
+  rollout_actions: GitOpsRolloutAction[];
+};
+
+export type GitOpsTargetStatus = {
   application_name: string;
+  provider: "argocd" | "flux";
   provider_status: string;
   failure_code: string | null;
   project: string | null;
@@ -419,6 +543,8 @@ export type ArgoApplicationStatus = {
   revision: string | null;
   destination_name: string | null;
   destination_server: string | null;
+  namespace: string | null;
+  run_status: string | null;
 };
 
 export type InfrastructureTarget = {
@@ -585,5 +711,68 @@ export type SloAlert = {
   acknowledged_at: string | null;
   resolved_at: string | null;
   created_at: string;
+};
+
+export type Incident = {
+  id: string;
+  workspace_id: string;
+  service_id: string | null;
+  environment_id: string | null;
+  source_type: "manual" | "slo_alert" | "deployment" | "gitops";
+  source_id: string | null;
+  title: string;
+  description: string;
+  severity: "sev0" | "sev1" | "sev2" | "sev3";
+  status: "open" | "investigating" | "mitigated" | "resolved" | "closed";
+  resolution: string | null;
+  assigned_to: string | null;
+  opened_by: string | null;
+  escalation_level: number;
+  next_escalation_at: string | null;
+  opened_at: string;
+  mitigated_at: string | null;
+  resolved_at: string | null;
+  closed_at: string | null;
+  pagerduty_triggered_at: string | null;
+  pagerduty_resolved_notified_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type IncidentEvent = {
+  id: string;
+  incident_id: string;
+  workspace_id: string;
+  sequence: number;
+  event_type: string;
+  from_status: string | null;
+  to_status: string | null;
+  actor_type: string;
+  actor_id: string | null;
+  message: string;
+  details: Record<string, unknown>;
+  created_at: string;
+};
+
+export type IncidentPostmortem = {
+  id: string;
+  incident_id: string;
+  workspace_id: string;
+  status: "draft" | "in_review" | "published";
+  title: string;
+  summary: string;
+  impact: string;
+  root_cause: string;
+  detection: string;
+  response: string;
+  corrective_actions: string[];
+  author_id: string | null;
+  reviewer_id: string | null;
+  review_comment: string | null;
+  submitted_at: string | null;
+  published_at: string | null;
+  due_at: string | null;
+  created_at: string;
+  updated_at: string;
 };
 

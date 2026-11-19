@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ChevronDown, Layers3 } from "lucide-react";
 import { apiGet, type Environment, type Workspace } from "../lib/api";
 
@@ -8,6 +8,7 @@ export function WorkspaceSelector() {
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [workspaceId, setWorkspaceId] = useState(() => localStorage.getItem("deployforge.workspace") || "");
   const [unavailable, setUnavailable] = useState(false);
+  const announcedWorkspaceId = useRef(workspaceId);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -27,6 +28,8 @@ export function WorkspaceSelector() {
 
   useEffect(() => {
     localStorage.setItem("deployforge.workspace", workspaceId);
+    if (announcedWorkspaceId.current === workspaceId) return;
+    announcedWorkspaceId.current = workspaceId;
     localStorage.removeItem("deployforge.environment");
     window.dispatchEvent(new CustomEvent(WORKSPACE_EVENT, { detail: workspaceId }));
   }, [workspaceId]);
@@ -55,6 +58,7 @@ export function EnvironmentSelector() {
   const [workspaceId, setWorkspaceId] = useState(() => localStorage.getItem("deployforge.workspace") || "");
   const [environments, setEnvironments] = useState<Environment[]>([]);
   const [environmentId, setEnvironmentId] = useState(() => localStorage.getItem("deployforge.environment") || "");
+  const loadedWorkspaceId = useRef(workspaceId);
 
   useEffect(() => {
     const onWorkspaceChanged = (event: Event) => {
@@ -68,15 +72,22 @@ export function EnvironmentSelector() {
 
   useEffect(() => {
     if (!workspaceId) {
+      loadedWorkspaceId.current = "";
       setEnvironments([]);
       setEnvironmentId("");
       return;
+    }
+    // Scope changes reset to the full workspace; users can narrow by environment afterward.
+    if (loadedWorkspaceId.current !== workspaceId) {
+      loadedWorkspaceId.current = workspaceId;
+      setEnvironmentId("");
+      localStorage.removeItem("deployforge.environment");
     }
     const controller = new AbortController();
     apiGet<Environment[]>(`/workspaces/${workspaceId}/environments`, controller.signal)
       .then((items) => {
         setEnvironments(items);
-        if (!items.some((item) => item.id === environmentId)) setEnvironmentId(items[0]?.id || "");
+        setEnvironmentId((current) => current && !items.some((item) => item.id === current) ? "" : current);
       })
       .catch(() => setEnvironments([]));
     return () => controller.abort();
@@ -99,7 +110,10 @@ export function EnvironmentSelector() {
         {environments.length === 0 ? (
           <option value="">No environment selected</option>
         ) : (
-          environments.map((environment) => <option key={environment.id} value={environment.id}>{environment.name}</option>)
+          <>
+            <option value="">All environments</option>
+            {environments.map((environment) => <option key={environment.id} value={environment.id}>{environment.name}</option>)}
+          </>
         )}
       </select>
       <ChevronDown size={14} />

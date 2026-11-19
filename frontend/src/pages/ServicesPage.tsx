@@ -20,12 +20,16 @@ import {
   X,
 } from "lucide-react";
 import { PageFrame } from "../components/PageFrame";
+import { FieldLabel, FormDrawer } from "../components/FormDrawer";
+import { ViewAction } from "../components/RecordDrawer";
+import { formatDate, TablePagination } from "../components/WorkspacePage";
 import {
   apiGet,
   apiPatch,
   apiPost,
   type AuthSession,
   type GoldenPath,
+  type GitHubRepositoryProvisioning,
   type ServiceCatalog,
   type ServiceCatalogSummary,
   type ServiceCriticality,
@@ -66,10 +70,6 @@ function slugFromName(value: string) {
   return value.toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 100);
 }
 
-function displayDate(value: string) {
-  return new Intl.DateTimeFormat(undefined, { dateStyle: "medium" }).format(new Date(value));
-}
-
 function lifecycleLabel(value: ServiceLifecycle) {
   return value.charAt(0).toUpperCase() + value.slice(1);
 }
@@ -92,12 +92,14 @@ export default function ServicesPage() {
   const [summary, setSummary] = useState<ServiceCatalogSummary | null>(null);
   const [teams, setTeams] = useState<ServiceTeam[]>([]);
   const [goldenPaths, setGoldenPaths] = useState<GoldenPath[]>([]);
+  const [repositoryProvisionings, setRepositoryProvisionings] = useState<GitHubRepositoryProvisioning[]>([]);
   const [tab, setTab] = useState<"services" | "golden-paths">("services");
   const [query, setQuery] = useState("");
   const [search, setSearch] = useState("");
   const [lifecycle, setLifecycle] = useState("all");
   const [ownerTeamId, setOwnerTeamId] = useState("all");
   const [page, setPage] = useState(0);
+  const [pageSize, setPageSize] = useState(50);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -108,20 +110,44 @@ export default function ServicesPage() {
   const [editingService, setEditingService] = useState<ServiceRecord | null>(null);
   const [selectedPath, setSelectedPath] = useState<GoldenPath | null>(null);
   const [draft, setDraft] = useState<ServiceDraft>(emptyDraft);
+  const [draftBaseline, setDraftBaseline] = useState<ServiceDraft>(emptyDraft);
   const requestSequence = useRef(0);
+  const activeWorkspace = useRef(workspaceId);
+  activeWorkspace.current = workspaceId;
 
   const selectedRole = session?.memberships.find((membership) => membership.workspace_id === workspaceId)?.role;
   const canWrite = Boolean(session?.user.is_platform_admin || selectedRole === "workspace_admin" || selectedRole === "platform_engineer");
 
   useEffect(() => {
     const onWorkspaceChanged = (event: Event) => {
-      setWorkspaceId((event as CustomEvent<string>).detail || "");
+      const nextWorkspace = event.type === "storage" ? localStorage.getItem("deployforge.workspace") || "" : (event as CustomEvent<string>).detail || "";
+      if (nextWorkspace === activeWorkspace.current) return;
+      activeWorkspace.current = nextWorkspace;
+      requestSequence.current += 1;
+      setWorkspaceId(nextWorkspace);
+      setQuery("");
+      setSearch("");
+      setLifecycle("all");
+      setOwnerTeamId("all");
+      setPage(0);
+      setCatalog(null);
+      setSummary(null);
+      setTeams([]);
+      setGoldenPaths([]);
+      setRepositoryProvisionings([]);
+      setLoading(Boolean(nextWorkspace));
+      setError("");
+      setNotice("");
       setSelectedService(null);
       setFormOpen(false);
       setTeamOpen(false);
     };
     window.addEventListener("deployforge:workspace-changed", onWorkspaceChanged);
-    return () => window.removeEventListener("deployforge:workspace-changed", onWorkspaceChanged);
+    window.addEventListener("storage", onWorkspaceChanged);
+    return () => {
+      window.removeEventListener("deployforge:workspace-changed", onWorkspaceChanged);
+      window.removeEventListener("storage", onWorkspaceChanged);
+    };
   }, []);
 
   useEffect(() => {
@@ -129,7 +155,11 @@ export default function ServicesPage() {
     return () => window.clearTimeout(timer);
   }, [query]);
 
-  useEffect(() => { setPage(0); }, [search, lifecycle, ownerTeamId, workspaceId]);
+  useEffect(() => { setPage(0); }, [search, lifecycle, ownerTeamId, workspaceId, pageSize]);
+
+  useEffect(() => {
+    if (catalog) setPage((current) => Math.min(current, Math.max(0, Math.ceil(catalog.total / pageSize) - 1)));
+  }, [catalog, pageSize]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -138,40 +168,70 @@ export default function ServicesPage() {
   }, []);
 
   const loadCatalog = useCallback(async () => {
+    if (workspaceId !== activeWorkspace.current) return;
     const requestId = ++requestSequence.current;
     if (!workspaceId) {
       setCatalog({ items: [], total: 0, limit: 50, offset: 0 });
       setSummary(null);
       setTeams([]);
       setGoldenPaths([]);
+      setRepositoryProvisionings([]);
       setLoading(false);
       return;
     }
     setLoading(true);
     setError("");
     try {
-      const params = new URLSearchParams({ limit: "20", offset: String(page * 20) });
+      const params = new URLSearchParams({ limit: String(pageSize), offset: String(page * pageSize) });
       if (search) params.set("search", search);
       if (lifecycle !== "all") params.set("lifecycle", lifecycle);
       if (ownerTeamId !== "all") params.set("owner_team_id", ownerTeamId);
-      const [services, serviceSummary, availableTeams, paths] = await Promise.all([
+      const [services, serviceSummary, availableTeams, paths, provisionings] = await Promise.all([
         apiGet<ServiceCatalog>(`/workspaces/${workspaceId}/services?${params.toString()}`),
         apiGet<ServiceCatalogSummary>(`/workspaces/${workspaceId}/services/summary`),
         apiGet<ServiceTeam[]>(`/workspaces/${workspaceId}/teams`),
         apiGet<GoldenPath[]>(`/workspaces/${workspaceId}/golden-paths`),
+        apiGet<GitHubRepositoryProvisioning[]>(`/workspaces/${workspaceId}/repository-provisionings`),
       ]);
-      if (requestId !== requestSequence.current) return;
+      if (requestId !== requestSequence.current || workspaceId !== activeWorkspace.current) return;
       setCatalog(services);
       setSummary(serviceSummary);
       setTeams(availableTeams);
       setGoldenPaths(paths);
+      setRepositoryProvisionings(provisionings);
     } catch (caught) {
-      if (requestId !== requestSequence.current) return;
+      if (requestId !== requestSequence.current || workspaceId !== activeWorkspace.current) return;
       setError(caught instanceof Error ? caught.message : "Could not load the service catalog.");
     } finally {
-      if (requestId === requestSequence.current) setLoading(false);
+      if (requestId === requestSequence.current && workspaceId === activeWorkspace.current) setLoading(false);
     }
-  }, [workspaceId, search, lifecycle, ownerTeamId, page]);
+  }, [workspaceId, search, lifecycle, ownerTeamId, page, pageSize]);
+
+  useEffect(() => {
+    if (!workspaceId || !repositoryProvisionings.some((job) => job.status === "queued" || job.status === "dispatching")) return;
+    let refreshing = false;
+    const timer = window.setInterval(async () => {
+      if (refreshing || workspaceId !== activeWorkspace.current) return;
+      refreshing = true;
+      try {
+        const updated = await apiGet<GitHubRepositoryProvisioning[]>(`/workspaces/${workspaceId}/repository-provisionings`);
+        const completed = updated.some((job) => job.status === "succeeded" && repositoryProvisionings.some((previous) => previous.id === job.id && (previous.status === "queued" || previous.status === "dispatching")));
+        setRepositoryProvisionings(updated);
+        if (completed) {
+          if (selectedService && updated.some((job) => job.service_id === selectedService.id && job.status === "succeeded")) {
+            const service = await apiGet<ServiceRecord>(`/workspaces/${workspaceId}/services/${selectedService.id}`);
+            setSelectedService(service);
+          }
+          void loadCatalog();
+        }
+      } catch {
+        // A later poll will refresh transient catalog or network failures.
+      } finally {
+        refreshing = false;
+      }
+    }, 3000);
+    return () => window.clearInterval(timer);
+  }, [workspaceId, repositoryProvisionings, selectedService, loadCatalog]);
 
   useEffect(() => {
     void loadCatalog();
@@ -194,10 +254,34 @@ export default function ServicesPage() {
   }, [workspaceId, searchParams, setSearchParams]);
 
   const services = catalog?.items ?? [];
+  const isFiltering = Boolean(query.trim() || lifecycle !== "all" || ownerTeamId !== "all");
+
+  function resetFilters() {
+    setQuery("");
+    setSearch("");
+    setLifecycle("all");
+    setOwnerTeamId("all");
+    setPage(0);
+  }
+
+  function viewLifecycle(value: string) {
+    resetFilters();
+    setLifecycle(value);
+    setTab("services");
+  }
+
+  function navigateTabs(event: React.KeyboardEvent<HTMLButtonElement>) {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    const nextTab = event.key === "Home" ? "services" : event.key === "End" ? "golden-paths" : tab === "services" ? "golden-paths" : "services";
+    setTab(nextTab);
+    document.getElementById(`${nextTab}-tab`)?.focus();
+  }
+
   function openCreate(path: GoldenPath | null = null) {
     setEditingService(null);
     setSelectedPath(path);
-    setDraft({
+    const nextDraft = {
       ...emptyDraft,
       ...(path ? {
         name: "",
@@ -205,7 +289,9 @@ export default function ServicesPage() {
         metadata: Object.fromEntries(Object.entries(path.defaults).map(([key, value]) => [key, String(value)])),
       } : {}),
       owner_team_id: teams[0]?.id || "",
-    });
+    };
+    setDraft(nextDraft);
+    setDraftBaseline(nextDraft);
     setError("");
     setNotice("");
     setFormOpen(true);
@@ -215,7 +301,7 @@ export default function ServicesPage() {
     setSelectedService(null);
     setEditingService(service);
     setSelectedPath(null);
-    setDraft({
+    const nextDraft = {
       slug: service.slug,
       name: service.name,
       description: service.description || "",
@@ -227,7 +313,9 @@ export default function ServicesPage() {
       criticality: service.criticality,
       tags: service.tags.join(", "),
       metadata: Object.fromEntries(Object.entries(service.metadata).map(([key, value]) => [key, String(value)])),
-    });
+    };
+    setDraft(nextDraft);
+    setDraftBaseline(nextDraft);
     setError("");
     setFormOpen(true);
   }
@@ -288,6 +376,36 @@ export default function ServicesPage() {
     }
   }
 
+  async function createRepository(service: ServiceRecord) {
+    if (!workspaceId) return;
+    setSaving(true);
+    setError("");
+    try {
+      const job = await apiPost<GitHubRepositoryProvisioning>(`/workspaces/${workspaceId}/services/${service.id}/repository-provisioning`);
+      setRepositoryProvisionings((current) => [job, ...current.filter((item) => item.id !== job.id)]);
+      setNotice(`Private GitHub repository requested for ${service.name}.`);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Repository creation could not be requested.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function retryRepository(job: GitHubRepositoryProvisioning) {
+    if (!workspaceId) return;
+    setSaving(true);
+    setError("");
+    try {
+      const retried = await apiPost<GitHubRepositoryProvisioning>(`/workspaces/${workspaceId}/repository-provisionings/${job.id}/retry`);
+      setRepositoryProvisionings((current) => current.map((item) => item.id === retried.id ? retried : item));
+      setNotice(`Repository creation retried for ${job.repository_name}.`);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Repository creation could not be retried.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
   async function createTeam(slug: string, name: string, description: string) {
     if (!workspaceId) return;
     setSaving(true);
@@ -314,16 +432,16 @@ export default function ServicesPage() {
       ) : (
         <>
           <div className="catalog-summary">
-            <SummaryCard label="Catalog services" value={summary?.total ?? "—"} detail="In this workspace" icon={<Boxes size={17} />} />
-            <SummaryCard label="Production" value={summary?.production ?? "—"} detail="Live lifecycle" icon={<ShieldCheck size={17} />} tone="green" />
-            <SummaryCard label="Experimental" value={summary?.experimental ?? "—"} detail="In active development" icon={<Workflow size={17} />} tone="violet" />
-            <SummaryCard label="Ownership teams" value={summary?.ownership_teams ?? "—"} detail="Clear service ownership" icon={<Layers3 size={17} />} tone="blue" />
+            <SummaryCard label="Catalog services" value={summary?.total ?? "—"} detail="View all services" icon={<Boxes size={17} />} active={tab === "services" && !isFiltering} onClick={() => viewLifecycle("all")} />
+            <SummaryCard label="Production" value={summary?.production ?? "—"} detail="View production services" icon={<ShieldCheck size={17} />} tone="green" active={tab === "services" && lifecycle === "production"} onClick={() => viewLifecycle("production")} />
+            <SummaryCard label="Experimental" value={summary?.experimental ?? "—"} detail="View services in development" icon={<Workflow size={17} />} tone="violet" active={tab === "services" && lifecycle === "experimental"} onClick={() => viewLifecycle("experimental")} />
+            <SummaryCard label="Ownership teams" value={summary?.ownership_teams ?? "—"} detail="View ownership teams" icon={<Layers3 size={17} />} tone="blue" onClick={() => setTeamOpen(true)} />
           </div>
 
           <div className="catalog-toolbar">
             <div className="catalog-tabs" role="tablist" aria-label="Service catalog views">
-              <button role="tab" aria-selected={tab === "services"} className={tab === "services" ? "is-active" : ""} onClick={() => setTab("services")}>Services <span>{catalog?.total ?? 0}</span></button>
-              <button role="tab" aria-selected={tab === "golden-paths"} className={tab === "golden-paths" ? "is-active" : ""} onClick={() => setTab("golden-paths")}>Golden paths <span>{goldenPaths.length}</span></button>
+              <button id="services-tab" role="tab" aria-controls="services-panel" aria-selected={tab === "services"} tabIndex={tab === "services" ? 0 : -1} className={tab === "services" ? "is-active" : ""} onClick={() => setTab("services")} onKeyDown={navigateTabs}>Services <span>{summary?.total ?? 0}</span></button>
+              <button id="golden-paths-tab" role="tab" aria-controls="golden-paths-panel" aria-selected={tab === "golden-paths"} tabIndex={tab === "golden-paths" ? 0 : -1} className={tab === "golden-paths" ? "is-active" : ""} onClick={() => setTab("golden-paths")} onKeyDown={navigateTabs}>Golden paths <span>{goldenPaths.length}</span></button>
             </div>
             <div className="catalog-actions">
               {tab === "services" && <button className="catalog-secondary-button" onClick={() => setTeamOpen(true)}><Settings2 size={14} /> Manage teams</button>}
@@ -332,15 +450,19 @@ export default function ServicesPage() {
           </div>
 
           {tab === "services" ? (
-            <section className="catalog-panel">
+            <section id="services-panel" className="catalog-panel" role="tabpanel" aria-labelledby="services-tab" aria-busy={loading}>
+              <div className="catalog-filter-panel">
               <div className="catalog-filter-row">
-                <label className="catalog-search"><Search size={15} /><input aria-label="Search services" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search by service, owner, system or repository…" /></label>
+                <label className="catalog-search"><Search size={15} /><input type="search" aria-label="Search services" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search by service, owner, system or repository…" /></label>
                 <label className="catalog-lifecycle-filter"><span>Lifecycle</span><select value={lifecycle} onChange={(event) => setLifecycle(event.target.value)}><option value="all">All lifecycles</option><option value="production">Production</option><option value="experimental">Experimental</option><option value="deprecated">Deprecated</option><option value="retired">Retired</option></select><ChevronDown size={13} /></label>
                 <label className="catalog-lifecycle-filter"><span>Owner</span><select value={ownerTeamId} onChange={(event) => setOwnerTeamId(event.target.value)}><option value="all">All teams</option>{teams.map((team) => <option key={team.id} value={team.id}>{team.name}</option>)}</select><ChevronDown size={13} /></label>
               </div>
+              <div className="catalog-filter-footer"><span>{catalog?.total ?? 0} {isFiltering ? "matching " : ""}{catalog?.total === 1 ? "service" : "services"}<span className="filter-auto-apply"> · Filters apply automatically</span></span><button type="button" className="catalog-secondary-button" onClick={resetFilters} disabled={!isFiltering}>Reset filters</button></div>
+              </div>
               <div className="catalog-table-wrap">
-                <table className="catalog-table">
-                  <thead><tr><th>Service</th><th>Owner team</th><th>Lifecycle</th><th>Criticality</th><th>Repository</th><th>Updated</th><th><span className="sr-only">Details</span></th></tr></thead>
+                <table className="catalog-table has-actions">
+                  <caption className="sr-only">Workspace service catalog with ownership, lifecycle, criticality, repository and record actions</caption>
+                  <thead><tr><th scope="col">Service</th><th scope="col">Owner team</th><th scope="col">Lifecycle</th><th scope="col">Criticality</th><th scope="col">Repository</th><th scope="col">Updated</th><th scope="col">Actions</th></tr></thead>
                   <tbody>
                     {services.map((service) => <tr key={service.id}>
                       <td><button className="catalog-service-cell" onClick={() => setSelectedService(service)}><span className="catalog-service-mark"><Boxes size={16} /></span><span><strong>{service.name}</strong><small>{service.slug}{service.system ? ` · ${service.system}` : ""}</small></span></button></td>
@@ -348,18 +470,19 @@ export default function ServicesPage() {
                       <td><span className={`lifecycle-pill lifecycle-${service.lifecycle}`}>{service.lifecycle === "production" ? <span className="status-dot" /> : null}{lifecycleLabel(service.lifecycle)}</span></td>
                       <td><span className={`tier-pill tier-${service.criticality}`}>{criticalityLabel(service.criticality)}</span></td>
                       <td>{service.repository_url ? <a className="catalog-repo-link" href={service.repository_url} target="_blank" rel="noreferrer"><GitBranch size={13} />Repository<ExternalLink size={11} /></a> : <span className="muted-cell">Not connected</span>}</td>
-                      <td className="catalog-date">{displayDate(service.updated_at)}</td>
-                      <td><button className="catalog-open-button" aria-label={`View ${service.name}`} onClick={() => setSelectedService(service)}><ArrowUpRight size={15} /></button></td>
+                      <td className="catalog-date">{formatDate(service.updated_at)}</td>
+                      <td><ViewAction label={service.name} onClick={() => setSelectedService(service)} /></td>
                     </tr>)}
                   </tbody>
                 </table>
                 {loading ? <div className="catalog-loading"><LoaderCircle size={17} /> Loading service catalog…</div> : services.length === 0 ? <div className="catalog-list-empty"><div className="catalog-empty-icon"><Boxes size={20} /></div><strong>{query || lifecycle !== "all" || ownerTeamId !== "all" ? "No services match these filters" : "Your catalog is ready"}</strong><p>{query || lifecycle !== "all" || ownerTeamId !== "all" ? "Try a different search term or filter." : "Register a service directly or start with a golden path to establish ownership and standards."}</p>{canWrite && !query && lifecycle === "all" && ownerTeamId === "all" && <button className="catalog-primary-button" onClick={() => { setTab("golden-paths"); }}><ArrowDownRight size={14} /> Explore golden paths</button>}</div> : null}
               </div>
-              <div className="catalog-table-footer"><span>Showing {catalog?.total ? catalog.offset + 1 : 0}–{catalog ? catalog.offset + services.length : 0} of {catalog?.total ?? 0} services</span><div className="catalog-pagination"><button disabled={loading || page === 0} onClick={() => setPage((value) => Math.max(0, value - 1))}>Previous</button><span>Page {page + 1} of {Math.max(1, Math.ceil((catalog?.total ?? 0) / 20))}</span><button disabled={loading || !catalog || (page + 1) * 20 >= catalog.total} onClick={() => setPage((value) => value + 1)}>Next</button></div><span><span className="status-dot" />Workspace scoped inventory</span></div>
+              <div className="catalog-page-size"><label>Rows per page<select aria-label="Services per page" value={pageSize} onChange={(event) => { setPageSize(Number(event.target.value)); setPage(0); }}><option value={10}>10</option><option value={25}>25</option><option value={50}>50</option><option value={100}>100</option></select></label><span><span className="status-dot" /> Workspace scoped inventory</span></div>
+              <TablePagination firstItem={catalog?.total ? catalog.offset + 1 : 0} lastItem={catalog ? catalog.offset + services.length : 0} totalItems={catalog?.total ?? 0} page={page} pageCount={Math.max(1, Math.ceil((catalog?.total ?? 0) / pageSize))} onPageChange={setPage} disabled={loading} label="services" />
             </section>
           ) : (
-            <section className="golden-path-section">
-              <div className="golden-path-intro"><div className="golden-path-intro-icon"><Workflow size={18} /></div><div><strong>Supported paths for new services</strong><p>Consistent starting points with explicit defaults and platform capabilities. Choosing a path registers the service metadata; repository scaffolding becomes available with a source control integration.</p></div></div>
+            <section id="golden-paths-panel" className="golden-path-section" role="tabpanel" aria-labelledby="golden-paths-tab">
+              <div className="golden-path-intro"><div className="golden-path-intro-icon"><Workflow size={18} /></div><div><strong>Supported paths for new services</strong><p>Consistent starting points with explicit defaults and platform capabilities. Where GitHub templates are configured, create the private repository from the service details after registration.</p></div></div>
               {loading ? <div className="catalog-loading"><LoaderCircle size={17} /> Loading golden paths…</div> : <div className="golden-path-grid">{goldenPaths.map((path) => <article className="golden-path-card" key={path.id}>
                 <div className="golden-path-card-top"><span className={`golden-path-icon golden-icon-${path.category.toLowerCase()}`}><GoldenPathIcon icon={path.icon} /></span><span className="golden-path-category">{path.category}</span><span className="golden-path-version">v{path.version}</span></div>
                 <h2>{path.name}</h2><p className="golden-path-description">{path.description}</p>
@@ -377,20 +500,34 @@ export default function ServicesPage() {
         path={selectedPath}
         editing={editingService}
         busy={saving}
+        error={error}
+        dirty={JSON.stringify(draft) !== JSON.stringify(draftBaseline)}
         canCreateTeam={canWrite}
         onClose={() => setFormOpen(false)}
+        onReset={() => setDraft(draftBaseline)}
         onOpenTeams={() => setTeamOpen(true)}
         onChange={updateDraft}
         onSubmit={submitService}
       />}
-      {teamOpen && <TeamModal teams={teams} busy={saving} canWrite={canWrite} onClose={() => setTeamOpen(false)} onCreate={createTeam} />}
-      {selectedService && <ServiceDetails service={selectedService} canWrite={canWrite} busy={saving} onClose={() => setSelectedService(null)} onEdit={() => openEdit(selectedService)} onArchive={() => void archiveService(selectedService)} />}
+      {teamOpen && <TeamModal teams={teams} busy={saving} error={error} canWrite={canWrite} onClose={() => setTeamOpen(false)} onCreate={createTeam} />}
+      {selectedService && <ServiceDetails
+        service={selectedService}
+        canWrite={canWrite}
+        busy={saving}
+        repositoryBootstrapAvailable={Boolean(selectedService.golden_path_slug && goldenPaths.find((path) => path.slug === selectedService.golden_path_slug)?.repository_bootstrap_available)}
+        repositoryProvisioning={repositoryProvisionings.find((job) => job.service_id === selectedService.id)}
+        onCreateRepository={() => void createRepository(selectedService)}
+        onRetryRepository={(job) => void retryRepository(job)}
+        onClose={() => setSelectedService(null)}
+        onEdit={() => openEdit(selectedService)}
+        onArchive={() => void archiveService(selectedService)}
+      />}
     </PageFrame>
   );
 }
 
-function SummaryCard({ label, value, detail, icon, tone = "cyan" }: { label: string; value: string | number; detail: string; icon: React.ReactNode; tone?: string }) {
-  return <article className="catalog-summary-card"><span className={`catalog-summary-icon tone-${tone}`}>{icon}</span><div><small>{label}</small><strong>{value}</strong><span>{detail}</span></div></article>;
+function SummaryCard({ label, value, detail, icon, tone = "cyan", active, onClick }: { label: string; value: string | number; detail: string; icon: React.ReactNode; tone?: string; active?: boolean; onClick: () => void }) {
+  return <button type="button" className={`catalog-summary-card catalog-kpi-button ${active ? "is-active" : ""}`} aria-pressed={active} onClick={onClick}><span className={`catalog-summary-icon tone-${tone}`}>{icon}</span><span className="catalog-summary-content"><small>{label}</small><strong>{value}</strong><span>{detail}</span></span><ArrowUpRight size={14} className="kpi-action-icon" /></button>;
 }
 
 function ServiceFormModal({
@@ -399,8 +536,11 @@ function ServiceFormModal({
   path,
   editing,
   busy,
+  error,
+  dirty,
   canCreateTeam,
   onClose,
+  onReset,
   onOpenTeams,
   onChange,
   onSubmit,
@@ -410,56 +550,60 @@ function ServiceFormModal({
   path: GoldenPath | null;
   editing: ServiceRecord | null;
   busy: boolean;
+  error: string;
+  dirty: boolean;
   canCreateTeam: boolean;
   onClose: () => void;
+  onReset: () => void;
   onOpenTeams: () => void;
   onChange: <K extends keyof ServiceDraft>(key: K, value: ServiceDraft[K]) => void;
   onSubmit: (event: React.FormEvent<HTMLFormElement>) => void;
 }) {
-  return <div className="catalog-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) onClose(); }}><section className="catalog-modal service-form-modal" role="dialog" aria-modal="true" aria-labelledby="service-form-title">
-    <div className="catalog-modal-heading"><span className="catalog-modal-heading-icon"><Boxes size={17} /></span><div><small>{editing ? "SERVICE CATALOG" : path ? `GOLDEN PATH · ${path.category.toUpperCase()}` : "SERVICE CATALOG"}</small><h2 id="service-form-title">{editing ? "Edit service" : path ? `Create from ${path.name}` : "Register service"}</h2><p>{path ? "Review the ownership and configuration details before adding this service." : "Record ownership, repository and operational metadata for a workspace service."}</p></div><button className="icon-button" onClick={onClose} aria-label="Close dialog"><X size={17} /></button></div>
-    <form className="catalog-form" onSubmit={onSubmit}>
+  return <FormDrawer title={editing ? "Edit service" : path ? `Create from ${path.name}` : "Register service"} eyebrow={path ? `GOLDEN PATH · ${path.category.toUpperCase()}` : "SERVICE CATALOG"} description={path ? "Review the ownership and configuration details before adding this service." : "Record ownership, repository and operational metadata for a workspace service."} className="service-form-drawer" busy={busy} dirty={dirty} error={error} onClose={onClose} onReset={onReset} actions={<button form="catalog-service-form" type="submit" className="catalog-primary-button" disabled={busy || !teams.length}>{busy && <LoaderCircle size={14} className="spin-icon" />}{editing ? "Save changes" : path ? "Add service to catalog" : "Register service"}</button>}>
+    <form id="catalog-service-form" className="catalog-form" onSubmit={onSubmit}>
       <div className="catalog-form-grid">
-        <label>Service name<input required minLength={2} maxLength={180} value={draft.name} onChange={(event) => { onChange("name", event.target.value); if (!editing) onChange("slug", slugFromName(event.target.value)); }} placeholder="Payments API" /></label>
-        <label>Service slug<input required pattern="[a-z0-9]([a-z0-9-]*[a-z0-9])?" maxLength={100} value={editing ? editing.slug : draft.slug} disabled={Boolean(editing)} onChange={(event) => onChange("slug", event.target.value)} placeholder="payments-api" /></label>
+        <label><FieldLabel required>Service name</FieldLabel><input required minLength={2} maxLength={180} value={draft.name} onChange={(event) => { onChange("name", event.target.value); if (!editing) onChange("slug", slugFromName(event.target.value)); }} placeholder="Payments API" /></label>
+        <label><FieldLabel required={!editing}>Service slug</FieldLabel><input required pattern="[a-z0-9]([a-z0-9-]*[a-z0-9])?" maxLength={100} value={editing ? editing.slug : draft.slug} disabled={Boolean(editing)} onChange={(event) => onChange("slug", event.target.value)} placeholder="payments-api" /></label>
         <label className="catalog-form-wide">Description<textarea maxLength={5000} rows={2} value={draft.description} onChange={(event) => onChange("description", event.target.value)} placeholder="What this service does and who depends on it" /></label>
-        <label>Owner team<div className="catalog-select-wrap"><select required value={draft.owner_team_id} onChange={(event) => onChange("owner_team_id", event.target.value)}><option value="">Select owner team</option>{teams.map((team) => <option key={team.id} value={team.id}>{team.name}</option>)}</select><ChevronDown size={14} /></div></label>
-        <label>System <span className="form-optional">optional</span><input maxLength={120} value={draft.system} onChange={(event) => onChange("system", event.target.value)} placeholder="Commerce platform" /></label>
-        <label className="catalog-form-wide">Repository URL <span className="form-optional">optional</span><input maxLength={500} type="url" value={draft.repository_url} onChange={(event) => onChange("repository_url", event.target.value)} placeholder="https://github.com/acme/payments-api" /></label>
-        <label className="catalog-form-wide">Documentation URL <span className="form-optional">optional</span><input maxLength={500} type="url" value={draft.documentation_url} onChange={(event) => onChange("documentation_url", event.target.value)} placeholder="https://docs.acme.dev/payments" /></label>
+        <label><FieldLabel required>Owner team</FieldLabel><div className="catalog-select-wrap"><select required value={draft.owner_team_id} onChange={(event) => onChange("owner_team_id", event.target.value)}><option value="">Select owner team</option>{teams.map((team) => <option key={team.id} value={team.id}>{team.name}</option>)}</select><ChevronDown size={14} /></div></label>
+        <label><span className="field-label">System <span className="form-optional">optional</span></span><input maxLength={120} value={draft.system} onChange={(event) => onChange("system", event.target.value)} placeholder="Commerce platform" /></label>
+        <label className="catalog-form-wide"><span className="field-label">Repository URL <span className="form-optional">optional</span></span><input maxLength={500} type="url" value={draft.repository_url} onChange={(event) => onChange("repository_url", event.target.value)} placeholder="https://github.com/acme/payments-api" /></label>
+        <label className="catalog-form-wide"><span className="field-label">Documentation URL <span className="form-optional">optional</span></span><input maxLength={500} type="url" value={draft.documentation_url} onChange={(event) => onChange("documentation_url", event.target.value)} placeholder="https://docs.acme.dev/payments" /></label>
         <label>Lifecycle<div className="catalog-select-wrap"><select value={draft.lifecycle} onChange={(event) => onChange("lifecycle", event.target.value as ServiceLifecycle)}><option value="experimental">Experimental</option><option value="production">Production</option><option value="deprecated">Deprecated</option><option value="retired">Retired</option></select><ChevronDown size={14} /></div></label>
         <label>Criticality<div className="catalog-select-wrap"><select value={draft.criticality} onChange={(event) => onChange("criticality", event.target.value as ServiceCriticality)}><option value="tier_0">Tier 0 · Critical</option><option value="tier_1">Tier 1 · High</option><option value="tier_2">Tier 2 · Standard</option><option value="tier_3">Tier 3 · Low</option></select><ChevronDown size={14} /></div></label>
-        <label className="catalog-form-wide">Tags <span className="form-optional">comma separated</span><input value={draft.tags} onChange={(event) => onChange("tags", event.target.value)} placeholder="payments, customer-facing, api" /></label>
+        <label className="catalog-form-wide"><span className="field-label">Tags <span className="form-optional">comma separated</span></span><input value={draft.tags} onChange={(event) => onChange("tags", event.target.value)} placeholder="payments, customer-facing, api" /></label>
       </div>
-      {path && path.config_schema.length > 0 && <div className="golden-config-block"><div><strong>Path configuration</strong><small>These values are stored as service metadata for this template version.</small></div><div className="catalog-form-grid">{path.config_schema.map((field) => <label key={field.key}>{field.label}{field.type === "select" ? <div className="catalog-select-wrap"><select required value={draft.metadata[field.key] || ""} onChange={(event) => onChange("metadata", { ...draft.metadata, [field.key]: event.target.value })}>{(field.options || []).map((option) => <option key={option} value={option}>{option}</option>)}</select><ChevronDown size={14} /></div> : <input value={draft.metadata[field.key] || ""} onChange={(event) => onChange("metadata", { ...draft.metadata, [field.key]: event.target.value })} />}</label>)}</div></div>}
+      {path && path.config_schema.length > 0 && <div className="golden-config-block"><div><strong>Path configuration</strong><small>These values are stored as service metadata for this template version.</small></div><div className="catalog-form-grid">{path.config_schema.map((field) => <label key={field.key}><FieldLabel required={field.type === "select"}>{field.label}</FieldLabel>{field.type === "select" ? <div className="catalog-select-wrap"><select required value={draft.metadata[field.key] || ""} onChange={(event) => onChange("metadata", { ...draft.metadata, [field.key]: event.target.value })}>{(field.options || []).map((option) => <option key={option} value={option}>{option}</option>)}</select><ChevronDown size={14} /></div> : <input value={draft.metadata[field.key] || ""} onChange={(event) => onChange("metadata", { ...draft.metadata, [field.key]: event.target.value })} />}</label>)}</div></div>}
       {teams.length === 0 && <div className="catalog-inline-warning"><CircleAlert size={14} /><span>Create an ownership team before registering a service.</span>{canCreateTeam && <button type="button" onClick={onOpenTeams}>Create team</button>}</div>}
-      {path && <div className="golden-path-disclosure"><ShieldCheck size={14} /><span>This registers catalog metadata only. Repository scaffolding and deployment are not started.</span></div>}
-      <div className="catalog-form-footer"><button type="button" className="catalog-secondary-button" onClick={onClose}>Cancel</button><button type="submit" className="catalog-primary-button" disabled={busy || !teams.length}>{busy && <LoaderCircle size={14} className="spin-icon" />}{editing ? "Save changes" : path ? "Add service to catalog" : "Register service"}</button></div>
+      {path && <div className="golden-path-disclosure"><ShieldCheck size={14} /><span>{path.repository_bootstrap_available ? "This adds the service to the catalog. You can request a private GitHub repository from the service details; deployments remain a separate step." : "This registers catalog metadata only. Repository creation and deployment are not started."}</span></div>}
     </form>
-  </section></div>;
+  </FormDrawer>;
 }
 
-function TeamModal({ teams, busy, canWrite, onClose, onCreate }: { teams: ServiceTeam[]; busy: boolean; canWrite: boolean; onClose: () => void; onCreate: (slug: string, name: string, description: string) => void }) {
+function TeamModal({ teams, busy, error, canWrite, onClose, onCreate }: { teams: ServiceTeam[]; busy: boolean; error: string; canWrite: boolean; onClose: () => void; onCreate: (slug: string, name: string, description: string) => void }) {
   const [name, setName] = useState("");
   const [slug, setSlug] = useState("");
   const [description, setDescription] = useState("");
-  return <div className="catalog-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) onClose(); }}><section className="catalog-modal team-modal" role="dialog" aria-modal="true" aria-labelledby="team-modal-title">
-    <div className="catalog-modal-heading"><span className="catalog-modal-heading-icon"><Layers3 size={17} /></span><div><small>OWNERSHIP MODEL</small><h2 id="team-modal-title">Service teams</h2><p>Keep every catalog entry attached to an accountable team.</p></div><button className="icon-button" onClick={onClose} aria-label="Close dialog"><X size={17} /></button></div>
+  return <FormDrawer title="Service teams" eyebrow="OWNERSHIP MODEL" description="Keep every catalog entry attached to an accountable team." busy={busy} dirty={Boolean(name || slug || description)} error={error} onClose={onClose} onReset={canWrite ? () => { setName(""); setSlug(""); setDescription(""); } : undefined} readOnly={!canWrite} actions={canWrite ? <button form="catalog-team-form" type="submit" className="catalog-primary-button" disabled={busy}>{busy && <LoaderCircle size={14} className="spin-icon" />}<Plus size={14} /> Create team</button> : undefined}>
     <div className="team-list">{teams.map((team) => <div className="team-list-row" key={team.id}><span className="team-avatar">{team.name.slice(0, 1).toUpperCase()}</span><span><strong>{team.name}</strong><small>{team.slug} · {team.service_count} {team.service_count === 1 ? "service" : "services"}</small></span></div>)}{teams.length === 0 && <div className="settings-empty">No ownership teams have been created for this workspace.</div>}</div>
-    {canWrite ? <form className="team-create-form" onSubmit={(event) => { event.preventDefault(); onCreate(slug, name.trim(), description.trim()); }}><div className="team-create-heading"><strong>Create team</strong><small>Teams are scoped to the selected workspace.</small></div><label>Team name<input required minLength={2} maxLength={120} value={name} onChange={(event) => { setName(event.target.value); setSlug(slugFromName(event.target.value).slice(0, 80)); }} placeholder="Payments" /></label><label>Team slug<input required pattern="[a-z0-9]([a-z0-9-]*[a-z0-9])?" maxLength={80} value={slug} onChange={(event) => setSlug(event.target.value)} placeholder="payments" /></label><label>Description <span className="form-optional">optional</span><input maxLength={2000} value={description} onChange={(event) => setDescription(event.target.value)} placeholder="Team responsibilities" /></label><button className="catalog-primary-button" disabled={busy}>{busy && <LoaderCircle size={14} className="spin-icon" />}<Plus size={14} /> Create team</button></form> : <div className="catalog-readonly-note">Workspace admin or platform engineer permission is required to create teams.</div>}
-  </section></div>;
+    {canWrite ? <form id="catalog-team-form" className="team-create-form" onSubmit={(event) => { event.preventDefault(); onCreate(slug, name.trim(), description.trim()); }}><div className="team-create-heading"><strong>Create team</strong><small>Teams are scoped to the selected workspace.</small></div><label><FieldLabel required>Team name</FieldLabel><input required minLength={2} maxLength={120} value={name} onChange={(event) => { setName(event.target.value); setSlug(slugFromName(event.target.value).slice(0, 80)); }} placeholder="Payments" /></label><label><FieldLabel required>Team slug</FieldLabel><input required pattern="[a-z0-9]([a-z0-9-]*[a-z0-9])?" maxLength={80} value={slug} onChange={(event) => setSlug(event.target.value)} placeholder="payments" /></label><label><span className="field-label">Description <span className="form-optional">optional</span></span><input maxLength={2000} value={description} onChange={(event) => setDescription(event.target.value)} placeholder="Team responsibilities" /></label></form> : <div className="catalog-readonly-note">Workspace admin or platform engineer permission is required to create teams.</div>}
+  </FormDrawer>;
 }
 
-function ServiceDetails({ service, canWrite, busy, onClose, onEdit, onArchive }: { service: ServiceRecord; canWrite: boolean; busy: boolean; onClose: () => void; onEdit: () => void; onArchive: () => void }) {
-  return <div className="catalog-drawer-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><aside className="catalog-drawer" role="dialog" aria-modal="true" aria-labelledby="service-details-title">
-    <header className="catalog-drawer-header"><div className="catalog-drawer-icon"><Boxes size={19} /></div><button className="icon-button" onClick={onClose} aria-label="Close service details"><X size={17} /></button></header>
-    <div className="catalog-drawer-title"><small>SERVICE DETAILS</small><h2 id="service-details-title">{service.name}</h2><p>{service.slug}{service.system ? ` · ${service.system}` : ""}</p><span className={`lifecycle-pill lifecycle-${service.lifecycle}`}>{lifecycleLabel(service.lifecycle)}</span></div>
+function ServiceDetails({ service, canWrite, busy, repositoryBootstrapAvailable, repositoryProvisioning, onCreateRepository, onRetryRepository, onClose, onEdit, onArchive }: { service: ServiceRecord; canWrite: boolean; busy: boolean; repositoryBootstrapAvailable: boolean; repositoryProvisioning?: GitHubRepositoryProvisioning; onCreateRepository: () => void; onRetryRepository: (job: GitHubRepositoryProvisioning) => void; onClose: () => void; onEdit: () => void; onArchive: () => void }) {
+  return <FormDrawer title={service.name} description={`${service.slug}${service.system ? ` · ${service.system}` : ""}`} eyebrow="SERVICE DETAILS" readOnly busy={busy} onClose={onClose} className="service-details-drawer" actions={canWrite ? <><button className="catalog-secondary-button" onClick={onEdit}><Settings2 size={14} /> Edit service</button>{service.lifecycle !== "retired" && <button className="catalog-danger-button" disabled={busy} onClick={onArchive}>Retire service</button>}</> : undefined}>
+    <div className="service-details-status"><span className={`lifecycle-pill lifecycle-${service.lifecycle}`}>{lifecycleLabel(service.lifecycle)}</span></div>
     <div className="catalog-drawer-section"><h3>Ownership</h3><div className="service-detail-owner"><span className="team-avatar">{service.owner_team_name?.slice(0, 1).toUpperCase() || "?"}</span><span><strong>{service.owner_team_name || "Unassigned"}</strong><small>Responsible team</small></span></div><DetailRow label="Criticality" value={criticalityLabel(service.criticality)} /><DetailRow label="System" value={service.system || "Not specified"} /></div>
     <div className="catalog-drawer-section"><h3>Source and documentation</h3><DetailLink label="Repository" value={service.repository_url} /><DetailLink label="Documentation" value={service.documentation_url} /></div>
-    <div className="catalog-drawer-section"><h3>Catalog metadata</h3><DetailRow label="Golden path" value={service.golden_path_slug || "Registered directly"} /><DetailRow label="Created" value={displayDate(service.created_at)} /><DetailRow label="Last updated" value={displayDate(service.updated_at)} />{service.tags.length > 0 && <div className="service-detail-tags">{service.tags.map((tag) => <span key={tag}>{tag}</span>)}</div>}{service.description && <p className="service-detail-description">{service.description}</p>}</div>
+    {!service.repository_url && service.golden_path_slug && repositoryBootstrapAvailable && canWrite && <div className="catalog-drawer-section"><h3>Repository bootstrap</h3>
+      {!repositoryProvisioning && <><p>Create a private GitHub repository in the configured platform owner using this service’s Golden Path template.</p><button className="catalog-primary-button" disabled={busy} onClick={onCreateRepository}><GitBranch size={14} /> Create private repository</button></>}
+      {repositoryProvisioning?.status === "queued" || repositoryProvisioning?.status === "dispatching" ? <div className="repository-bootstrap-state" role="status"><LoaderCircle size={15} className="spin-icon" /><span><strong>{repositoryProvisioning.status === "queued" ? "Request queued" : "Creating repository"}</strong><small>Attempt {repositoryProvisioning.attempt_count} of {repositoryProvisioning.max_attempts} · {repositoryProvisioning.repository_owner}/{repositoryProvisioning.repository_name}</small></span></div> : null}
+      {repositoryProvisioning?.status === "blocked" && <div className="repository-bootstrap-state is-error"><CircleAlert size={15} /><span><strong>Repository creation needs attention</strong><small>{repositoryProvisioning.failure_message || "GitHub could not create the repository."}</small></span><button className="catalog-secondary-button" disabled={busy} onClick={() => onRetryRepository(repositoryProvisioning)}>Retry</button></div>}
+      {repositoryProvisioning?.status === "succeeded" && <div className="repository-bootstrap-state is-success"><Check size={15} /><span><strong>Repository ready</strong><small>{repositoryProvisioning.default_branch ? `Default branch: ${repositoryProvisioning.default_branch}` : "GitHub repository created."}</small></span>{repositoryProvisioning.repository_url && <a href={repositoryProvisioning.repository_url} target="_blank" rel="noreferrer">Open <ExternalLink size={12} /></a>}</div>}
+    </div>}
+    <div className="catalog-drawer-section"><h3>Catalog metadata</h3><DetailRow label="Golden path" value={service.golden_path_slug || "Registered directly"} /><DetailRow label="Created" value={formatDate(service.created_at)} /><DetailRow label="Last updated" value={formatDate(service.updated_at)} />{service.tags.length > 0 && <div className="service-detail-tags">{service.tags.map((tag) => <span key={tag}>{tag}</span>)}</div>}{service.description && <p className="service-detail-description">{service.description}</p>}</div>
     {Object.keys(service.metadata).length > 0 && <div className="catalog-drawer-section"><h3>Path configuration</h3>{Object.entries(service.metadata).map(([key, value]) => <DetailRow key={key} label={key.replaceAll("_", " ")} value={String(value)} />)}</div>}
-    {canWrite && <footer className="catalog-drawer-actions"><button className="catalog-secondary-button" onClick={onEdit}><Settings2 size={14} /> Edit service</button>{service.lifecycle !== "retired" && <button className="catalog-danger-button" disabled={busy} onClick={onArchive}>Retire service</button>}</footer>}
-  </aside></div>;
+  </FormDrawer>;
 }
 
 function DetailRow({ label, value }: { label: string; value: string }) {

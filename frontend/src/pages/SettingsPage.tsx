@@ -1,7 +1,10 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { BookOpen, Building2, CircleUserRound, KeyRound, Plus, ShieldCheck, Trash2, UsersRound } from "lucide-react";
 import { PageFrame } from "../components/PageFrame";
 import { FieldLabel, FormDrawer } from "../components/FormDrawer";
+import { slugFromName } from "../lib/forms";
+import { RecordDrawer, ViewAction } from "../components/RecordDrawer";
+import { formatDate, TablePagination, TableToolbar, useTableView } from "../components/WorkspacePage";
 import { apiDelete, apiGet, apiPatch, apiPost, type AuthConfig, type AuthSession, type Workspace, type WorkspaceMember } from "../lib/api";
 
 const roles = ["workspace_admin", "platform_engineer", "service_owner", "auditor"] as const;
@@ -15,18 +18,41 @@ export default function SettingsPage() {
   const [members, setMembers] = useState<WorkspaceMember[]>([]);
   const [workspaceName, setWorkspaceName] = useState("");
   const [workspaceSlug, setWorkspaceSlug] = useState("");
+  const [workspaceSlugEdited, setWorkspaceSlugEdited] = useState(false);
+  const [workspaceCreateOpen, setWorkspaceCreateOpen] = useState(false);
   const [memberEmail, setMemberEmail] = useState("");
   const [memberRole, setMemberRole] = useState<Role>("platform_engineer");
+  const [grantOpen, setGrantOpen] = useState(false);
   const [reviewMemberId, setReviewMemberId] = useState("");
   const [reviewDecision, setReviewDecision] = useState<"retain" | "revoke">("retain");
   const [reviewComment, setReviewComment] = useState("");
+  const [selectedMemberId, setSelectedMemberId] = useState("");
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [compactDensity, setCompactDensity] = useState(() => localStorage.getItem("deployforge.density") === "compact");
   const [timeZone, setTimeZone] = useState(() => localStorage.getItem("deployforge.timezone") || "system");
+  const settingsRequest = useRef(0);
+  const activeWorkspace = useRef(workspaceId);
+  activeWorkspace.current = workspaceId;
+  const membersTable = useTableView(members, (member) => `${member.user.display_name} ${member.user.email} ${member.role}`, {
+    resetKey: workspaceId,
+    filters: [
+      { id: "role", label: "Role", getValue: (member) => member.role, options: roles.map((role) => ({ value: role, label: role.replaceAll("_", " ") })) },
+      { id: "account", label: "Account status", getValue: (member) => member.user.active ? "active" : "inactive", options: [{ value: "active", label: "Active" }, { value: "inactive", label: "Inactive" }] },
+    ],
+  });
+  const selectedMember = members.find((member) => member.membership_id === selectedMemberId);
+  const reviewMember = members.find((member) => member.membership_id === reviewMemberId);
 
-  useEffect(() => { setReviewMemberId(""); setReviewComment(""); }, [workspaceId]);
+  useEffect(() => {
+    setSelectedMemberId("");
+    setGrantOpen(false);
+    setMemberEmail("");
+    setMemberRole("platform_engineer");
+    setWorkspace(null);
+    setMembers([]);
+  }, [workspaceId]);
 
   useEffect(() => {
     localStorage.setItem("deployforge.density", compactDensity ? "compact" : "comfortable");
@@ -36,6 +62,8 @@ export default function SettingsPage() {
   useEffect(() => { localStorage.setItem("deployforge.timezone", timeZone); }, [timeZone]);
 
   const loadSettings = useCallback(async () => {
+    if (workspaceId !== activeWorkspace.current) return;
+    const requestId = ++settingsRequest.current;
     if (!workspaceId) {
       setWorkspace(null);
       setMembers([]);
@@ -47,11 +75,13 @@ export default function SettingsPage() {
         apiGet<Workspace[]>("/workspaces"),
         apiGet<WorkspaceMember[]>(`/workspaces/${workspaceId}/members`),
       ]);
+      if (requestId !== settingsRequest.current || workspaceId !== activeWorkspace.current) return;
       setSession(current);
       setWorkspace(workspaceList.find((item) => item.id === workspaceId) || null);
       setMembers(memberList);
       setError("");
     } catch (caught) {
+      if (requestId !== settingsRequest.current || workspaceId !== activeWorkspace.current) return;
       setError(caught instanceof Error ? caught.message : "Could not load access settings.");
     }
   }, [workspaceId]);
@@ -73,17 +103,17 @@ export default function SettingsPage() {
 
   useEffect(() => { void loadSettings(); }, [loadSettings]);
 
-  useEffect(() => {
-    const title = workspaceName.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
-    setWorkspaceSlug(title.slice(0, 80));
-  }, [workspaceName]);
+  function resetWorkspaceForm() {
+    setWorkspaceName(""); setWorkspaceSlug(""); setWorkspaceSlugEdited(false); setError("");
+  }
 
   async function createWorkspace(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (busy) return;
     setBusy(true);
     setError("");
     try {
-      const created = await apiPost<Workspace>("/workspaces", { name: workspaceName, slug: workspaceSlug });
+      const created = await apiPost<Workspace>("/workspaces", { name: workspaceName.trim(), slug: workspaceSlug.trim() });
       localStorage.setItem("deployforge.workspace", created.id);
       window.location.assign("/settings");
     } catch (caught) {
@@ -94,13 +124,15 @@ export default function SettingsPage() {
 
   async function grantAccess(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!workspaceId) return;
+    if (!workspaceId || busy) return;
     setBusy(true);
     setError("");
     setNotice("");
     try {
-      await apiPost(`/workspaces/${workspaceId}/members`, { email: memberEmail, role: memberRole });
+      await apiPost(`/workspaces/${workspaceId}/members`, { email: memberEmail.trim(), role: memberRole });
       setMemberEmail("");
+      setMemberRole("platform_engineer");
+      setGrantOpen(false);
       setNotice("Workspace access granted.");
       await loadSettings();
     } catch (caught) {
@@ -111,7 +143,7 @@ export default function SettingsPage() {
   }
 
   async function changeRole(member: WorkspaceMember, role: Role) {
-    if (!workspaceId) return;
+    if (!workspaceId || busy) return;
     setBusy(true);
     setError("");
     setNotice("");
@@ -128,7 +160,7 @@ export default function SettingsPage() {
   }
 
   async function revokeAccess(member: WorkspaceMember) {
-    if (!workspaceId || !window.confirm(`Revoke ${member.user.email}'s access to this workspace?`)) return;
+    if (!workspaceId || busy || !window.confirm(`Revoke ${member.user.email}'s access to this workspace?`)) return;
     setBusy(true);
     setError("");
     setNotice("");
@@ -172,8 +204,7 @@ export default function SettingsPage() {
   const isPlatformAdmin = Boolean(session?.user.is_platform_admin);
   const selectedRole = session?.memberships.find((membership) => membership.workspace_id === workspaceId)?.role;
   const canManageWorkspace = isPlatformAdmin || selectedRole === "workspace_admin";
-  const reviewMember = members.find((member) => member.membership_id === reviewMemberId);
-  const showCreateWorkspace = isPlatformAdmin && (!workspaceId || !workspace);
+  const showCreateWorkspace = isPlatformAdmin;
 
   return (
     <PageFrame eyebrow="GOVERNANCE" title="Settings" description="Manage workspace access, platform identity and control plane configuration.">
@@ -181,15 +212,18 @@ export default function SettingsPage() {
 
       {showCreateWorkspace && (
         <section className="settings-panel">
-          <div className="settings-panel-heading"><div className="settings-panel-icon"><Building2 size={17} /></div><div><h2>Create your first workspace</h2><p>Workspaces scope service ownership, environment access and audit history.</p></div></div>
-          <form className="settings-form settings-create-workspace" onSubmit={createWorkspace}>
-            <label>Workspace name<input required minLength={2} maxLength={160} value={workspaceName} onChange={(event) => setWorkspaceName(event.target.value)} placeholder="Production Platform" /></label>
-            <label>Workspace slug<input required pattern="[a-z0-9]([a-z0-9-]*[a-z0-9])?" maxLength={80} value={workspaceSlug} onChange={(event) => setWorkspaceSlug(event.target.value)} placeholder="production-platform" /></label>
-            <button className="settings-primary-button" disabled={busy || !workspaceSlug}><Plus size={15} /> Create workspace</button>
-          </form>
+          <div className="settings-panel-heading"><div className="settings-panel-icon"><Building2 size={17} /></div><div><h2>{workspace ? "Create another workspace" : "Create your first workspace"}</h2><p>Workspaces scope service ownership, environment access and audit history.</p></div><button type="button" className="settings-primary-button settings-heading-action" disabled={busy} onClick={() => { resetWorkspaceForm(); setWorkspaceCreateOpen(true); }}><Plus size={15} /> Create workspace</button></div>
           <p className="settings-footnote">The current platform administrator will be added as the workspace administrator. Workspace creation is recorded in the audit log.</p>
         </section>
       )}
+
+      {workspaceCreateOpen && isPlatformAdmin && <FormDrawer title="Create workspace" eyebrow="WORKSPACE SETUP" description="Create a boundary for service ownership, environments and audit history." busy={busy} error={error} dirty={Boolean(workspaceName || workspaceSlug)} onClose={() => { resetWorkspaceForm(); setWorkspaceCreateOpen(false); }} onReset={resetWorkspaceForm} actions={<button form="create-workspace-form" type="submit" className="settings-primary-button" disabled={busy}><Plus size={15} />{busy ? "Creating…" : "Create workspace"}</button>}>
+        <form id="create-workspace-form" className="resource-form" onSubmit={createWorkspace}>
+          <label><FieldLabel required>Workspace name</FieldLabel><input required minLength={2} maxLength={160} value={workspaceName} onChange={(event) => { setWorkspaceName(event.target.value); if (!workspaceSlugEdited) setWorkspaceSlug(slugFromName(event.target.value, 80)); }} placeholder="Production Platform" /></label>
+          <label><FieldLabel required>Workspace slug</FieldLabel><input required pattern="[a-z0-9]([a-z0-9-]*[a-z0-9])?" maxLength={80} value={workspaceSlug} onChange={(event) => { setWorkspaceSlug(event.target.value); setWorkspaceSlugEdited(true); }} placeholder="production-platform" aria-describedby="workspace-slug-hint" /></label>
+          <p id="workspace-slug-hint" className="form-note form-wide">Use lowercase letters, numbers and hyphens. The workspace slug is its permanent identifier.</p>
+        </form>
+      </FormDrawer>}
 
       <section className="settings-panel identity-panel">
         <div className="settings-panel-heading"><div className="settings-panel-icon"><CircleUserRound size={17} /></div><div><h2>Signed-in identity</h2><p>Your authenticated DeployForge account and platform-level permissions.</p></div></div>
@@ -205,19 +239,17 @@ export default function SettingsPage() {
       </section>
 
       <section className="settings-panel">
-        <div className="settings-panel-heading"><div className="settings-panel-icon"><UsersRound size={17} /></div><div><h2>Workspace members</h2><p>{workspace ? `${workspace.name} · Manage access for users who have signed in.` : "Select or create a workspace to manage its members."}</p></div></div>
+        <div className="settings-panel-heading"><div className="settings-panel-icon"><UsersRound size={17} /></div><div><h2>Workspace members</h2><p>{workspace ? `${workspace.name} · Manage access for users who have signed in.` : "Select or create a workspace to manage its members."}</p></div>{workspace && canManageWorkspace && <button type="button" className="settings-primary-button settings-heading-action" onClick={() => { setError(""); setGrantOpen(true); }}><Plus size={15} /> Grant access</button>}</div>
         {workspace && canManageWorkspace ? (
           <>
-            <form className="settings-form grant-access-form" onSubmit={grantAccess}>
-              <label>User email<input type="email" required value={memberEmail} onChange={(event) => setMemberEmail(event.target.value)} placeholder="engineer@company.com" /></label>
-              <label>Workspace role<select value={memberRole} onChange={(event) => setMemberRole(event.target.value as Role)}>{roles.filter((role) => role !== "workspace_admin" || isPlatformAdmin).map((role) => <option key={role} value={role}>{role.replaceAll("_", " ")}</option>)}</select></label>
-              <button className="settings-primary-button" disabled={busy}><Plus size={15} /> Grant access</button>
-            </form>
             <p className="settings-footnote"><KeyRound size={13} /> Users must complete sign-in before they can be added. Workspace administrators can manage access; only platform administrators can grant that role.</p>
             <div className="member-table-wrap">
-              <table className="member-table"><thead><tr><th>Member</th><th>Role</th><th>Access source</th><th>Access since</th><th><span className="sr-only">Actions</span></th></tr></thead>
-                <tbody>{members.map((member) => <tr key={member.membership_id}><td><div className="member-identity"><span className="member-avatar">{member.user.display_name.slice(0, 1).toUpperCase()}</span><span><strong>{member.user.display_name}</strong><small>{member.user.email}</small></span></div></td><td><select aria-label={`Role for ${member.user.email}`} disabled={busy || member.identity_source !== "manual" || (!isPlatformAdmin && member.role === "workspace_admin")} value={member.role} onChange={(event) => void changeRole(member, event.target.value as Role)}>{roles.filter((role) => role !== "workspace_admin" || isPlatformAdmin || member.role === role).map((role) => <option key={role} value={role}>{role.replaceAll("_", " ")}</option>)}</select></td><td>{member.identity_source === "idp" ? <span title={member.identity_groups.join(", ")}>Identity provider{member.identity_groups.length ? ` · ${member.identity_groups.slice(0, 2).join(", ")}${member.identity_groups.length > 2 ? ` +${member.identity_groups.length - 2}` : ""}` : ""}</span> : member.identity_source === "scim" ? <span title={member.identity_groups.join(", ")}>SCIM provisioning{member.identity_groups.length ? ` · ${member.identity_groups.slice(0, 2).join(", ")}${member.identity_groups.length > 2 ? ` +${member.identity_groups.length - 2}` : ""}` : ""}</span> : "Manual"}</td><td>{new Intl.DateTimeFormat(undefined, { dateStyle: "medium" }).format(new Date(member.created_at))}</td><td className="member-actions"><button type="button" className="icon-button" disabled={busy || member.user.id === session?.user.id} onClick={() => { setReviewMemberId(member.membership_id); setReviewDecision("retain"); setReviewComment(""); setError(""); }} aria-label={`Review ${member.user.email} access`} title="Record an independent access review"><ShieldCheck size={15} /></button><button className="icon-button danger-icon" disabled={busy || member.identity_source !== "manual"} onClick={() => void revokeAccess(member)} aria-label={`Revoke ${member.user.email}`} title={member.identity_source !== "manual" ? "Managed by the identity provider" : "Revoke workspace access"}><Trash2 size={15} /></button></td></tr>)}</tbody>
+              {members.length > 0 && <TableToolbar query={membersTable.query} onQueryChange={membersTable.setQuery} filteredCount={membersTable.filteredItems.length} totalCount={membersTable.totalItems} pageSize={membersTable.pageSize} onPageSizeChange={membersTable.setPageSize} filters={membersTable.filters} onFilterChange={membersTable.setFilterValue} onResetFilters={membersTable.resetFilters} isFiltering={membersTable.isFiltering} label="workspace members" />}
+              {members.length > 0 && membersTable.filteredItems.length === 0 && <div className="settings-empty">No members match this filter.</div>}
+              <table className="member-table has-actions"><caption className="sr-only">Workspace members, role, access source, review date and actions</caption><thead><tr><th scope="col">Member</th><th scope="col">Role</th><th scope="col">Access source</th><th scope="col">Access since</th><th scope="col">Actions</th></tr></thead>
+                <tbody>{membersTable.pageItems.map((member) => <tr key={member.membership_id}><td><div className="member-identity"><span className="member-avatar">{member.user.display_name.slice(0, 1).toUpperCase()}</span><span><strong>{member.user.display_name}</strong><small>{member.user.email}</small></span></div></td><td><select aria-label={`Role for ${member.user.email}`} disabled={busy || member.identity_source !== "manual" || (!isPlatformAdmin && member.role === "workspace_admin")} value={member.role} onChange={(event) => void changeRole(member, event.target.value as Role)}>{roles.filter((role) => role !== "workspace_admin" || isPlatformAdmin || member.role === role).map((role) => <option key={role} value={role}>{role.replaceAll("_", " ")}</option>)}</select></td><td>{member.identity_source === "idp" ? <span title={member.identity_groups?.join(", ")}>Identity provider{member.identity_groups?.length ? ` · ${member.identity_groups.slice(0, 2).join(", ")}` : ""}</span> : member.identity_source === "scim" ? <span title={member.identity_groups?.join(", ")}>SCIM provisioning{member.identity_groups?.length ? ` · ${member.identity_groups.slice(0, 2).join(", ")}` : ""}</span> : "Manual"}</td><td>{formatDate(member.created_at)}</td><td><div className="member-actions"><ViewAction label={member.user.display_name} onClick={() => setSelectedMemberId(member.membership_id)} /><button type="button" className="catalog-secondary-button" disabled={busy || member.user.id === session?.user.id} onClick={() => { setReviewMemberId(member.membership_id); setReviewDecision("retain"); setReviewComment(""); setError(""); }} aria-label={`Review ${member.user.email} access`}>Review</button><button className="icon-button danger-icon" disabled={busy || member.identity_source !== "manual"} onClick={() => void revokeAccess(member)} aria-label={`Revoke ${member.user.email}`} title={member.identity_source === "manual" ? "Revoke workspace access" : "Remove the mapped group to revoke managed access"}><Trash2 size={15} /></button></div></td></tr>)}</tbody>
               </table>
+              {members.length > 0 && <TablePagination firstItem={membersTable.firstItem} lastItem={membersTable.lastItem} totalItems={membersTable.filteredItems.length} page={membersTable.page} pageCount={membersTable.pageCount} onPageChange={membersTable.setPage} label="workspace members" />}
               {members.length === 0 && <div className="settings-empty">No workspace members are recorded yet.</div>}
             </div>
           </>
@@ -226,6 +258,12 @@ export default function SettingsPage() {
         )}
       </section>
 
+      {grantOpen && workspace && canManageWorkspace && <FormDrawer title="Grant workspace access" eyebrow="WORKSPACE MEMBERS" description={`Add an existing account to ${workspace.name} with the permissions needed for their work.`} busy={busy} error={error} dirty={Boolean(memberEmail || memberRole !== "platform_engineer")} onClose={() => { setGrantOpen(false); setMemberEmail(""); setMemberRole("platform_engineer"); }} onReset={() => { setMemberEmail(""); setMemberRole("platform_engineer"); }} actions={<button form="grant-workspace-access" type="submit" className="settings-primary-button" disabled={busy}><Plus size={15} /> Grant access</button>}>
+        <form id="grant-workspace-access" className="catalog-form" onSubmit={grantAccess}><div className="catalog-form-grid">
+          <label className="catalog-form-wide"><FieldLabel required>User email</FieldLabel><input type="email" required maxLength={254} value={memberEmail} onChange={(event) => setMemberEmail(event.target.value)} placeholder="engineer@company.com" /></label>
+          <label className="catalog-form-wide"><FieldLabel required>Workspace role</FieldLabel><select required value={memberRole} onChange={(event) => setMemberRole(event.target.value as Role)}>{roles.filter((role) => role !== "workspace_admin" || isPlatformAdmin).map((role) => <option key={role} value={role}>{role.replaceAll("_", " ")}</option>)}</select></label>
+        </div><p className="settings-footnote form-note"><KeyRound size={13} /> The user must sign in before access can be granted. Only platform administrators can assign the workspace administrator role.</p></form>
+      </FormDrawer>}
       {reviewMember && workspace && canManageWorkspace && <FormDrawer title="Review workspace access" eyebrow="ACCESS GOVERNANCE" description="Record an independent retain or revoke decision. The decision and rationale are written to the audit log." busy={busy} error={error} dirty={Boolean(reviewComment || reviewDecision !== "retain")} onClose={() => { setReviewMemberId(""); setReviewComment(""); }} onReset={() => { setReviewDecision("retain"); setReviewComment(""); }} actions={<button form="workspace-access-review" type="submit" className="settings-primary-button" disabled={busy || reviewComment.trim().length < 3}><ShieldCheck size={15} /> Record review</button>}>
         <form id="workspace-access-review" className="resource-form" onSubmit={reviewAccess}>
           <div className="form-wide"><strong>{reviewMember.user.display_name}</strong><p className="form-note">{reviewMember.user.email} · {reviewMember.role.replaceAll("_", " ")} · {reviewMember.identity_source === "idp" ? "Identity provider" : reviewMember.identity_source === "scim" ? "SCIM provisioning" : "Manual access"}</p></div>
@@ -234,6 +272,10 @@ export default function SettingsPage() {
           {reviewDecision === "revoke" && reviewMember.identity_source !== "manual" && <p className="form-note form-wide">This access is managed by an identity group. DeployForge records the review decision; remove the user from the mapped group in the identity provider to complete revocation.</p>}
         </form>
       </FormDrawer>}
+      {selectedMember && workspace && <RecordDrawer onClose={() => setSelectedMemberId("")} record={{ title: selectedMember.user.display_name, eyebrow: "WORKSPACE MEMBER", description: selectedMember.user.email, sections: [
+        { title: "Workspace access", fields: [{ label: "Workspace", value: workspace.name }, { label: "Role", value: selectedMember.role.replaceAll("_", " ") }, { label: "Access since", value: formatDate(selectedMember.created_at) }, { label: "Membership ID", value: selectedMember.membership_id, mono: true }] },
+        { title: "Account", fields: [{ label: "Account status", value: selectedMember.user.active ? "Active" : "Inactive" }, { label: "Email verification", value: selectedMember.user.email_verified ? "Verified" : "Unverified" }, { label: "Platform administrator", value: selectedMember.user.is_platform_admin ? "Yes" : "No" }, { label: "Account created", value: formatDate(selectedMember.user.created_at) }, { label: "User ID", value: selectedMember.user.id, mono: true }] },
+      ] }} />}
 
       <section className="settings-panel settings-placeholder">
         <div className="settings-panel-heading"><div className="settings-panel-icon"><KeyRound size={17} /></div><div><h2>Authentication configuration</h2><p>Sign-in capability is read from the live API configuration. Provider secrets remain server-side.</p></div></div>

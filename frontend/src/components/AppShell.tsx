@@ -6,7 +6,8 @@ import { PlatformStatus } from "./PlatformStatus";
 import { EnvironmentSelector, WorkspaceSelector } from "./WorkspaceControls";
 import { PlatformProvider } from "./PlatformContext";
 import AuthGate from "./AuthGate";
-import { ApiError, apiGet, apiPost, setCsrfToken, type AuthConfig, type AuthSession, type Deployment, type ServiceCatalog, type SloAlert } from "../lib/api";
+import { SearchDialog } from "./SearchDialog";
+import { ApiError, apiGet, apiGetAll, apiPost, setCsrfToken, type AuthConfig, type AuthSession, type Deployment, type ServiceCatalog, type SloAlert } from "../lib/api";
 
 type AuthState = "loading" | "ready" | "signed-out" | "unavailable";
 
@@ -23,6 +24,8 @@ export default function AppShell() {
   const [deploymentSearchResults, setDeploymentSearchResults] = useState<Deployment[]>([]);
   const [alertSearchResults, setAlertSearchResults] = useState<SloAlert[]>([]);
   const [serviceSearchLoading, setServiceSearchLoading] = useState(false);
+  const [searchError, setSearchError] = useState("");
+  const [resultScope, setResultScope] = useState("");
   const [navigationBadges, setNavigationBadges] = useState<Record<string, number>>({});
   const [profileOpen, setProfileOpen] = useState(false);
   const [authState, setAuthState] = useState<AuthState>("loading");
@@ -34,14 +37,29 @@ export default function AppShell() {
   const navigate = useNavigate();
   const currentPage = allNavigationItems.find((item) => item.path === location.pathname);
 
+  const acceptSession = useCallback((session: AuthSession) => {
+    const savedWorkspace = localStorage.getItem("deployforge.workspace") || "";
+    const allowed = session.user.is_platform_admin || session.memberships.some((membership) => membership.workspace_id === savedWorkspace);
+    if (!allowed) {
+      localStorage.removeItem("deployforge.workspace");
+      localStorage.removeItem("deployforge.environment");
+      setSelectedWorkspace("");
+      window.dispatchEvent(new CustomEvent("deployforge:workspace-changed", { detail: "" }));
+      window.dispatchEvent(new CustomEvent("deployforge:environment-changed", { detail: "" }));
+    } else {
+      setSelectedWorkspace(savedWorkspace);
+    }
+    setCsrfToken(session.csrf_token);
+    setAuthSession(session);
+    setAuthErrorCode(undefined);
+    setAuthState("ready");
+  }, []);
+
   const loadAuthentication = useCallback(async () => {
     setAuthState("loading");
     try {
       const session = await apiGet<AuthSession>("/auth/me");
-      setCsrfToken(session.csrf_token);
-      setAuthSession(session);
-      setAuthErrorCode(undefined);
-      setAuthState("ready");
+      acceptSession(session);
     } catch (error) {
       if (error instanceof ApiError && error.status === 401) {
         setCsrfToken("");
@@ -56,7 +74,7 @@ export default function AppShell() {
         setAuthState("unavailable");
       }
     }
-  }, []);
+  }, [acceptSession]);
 
   useEffect(() => { void loadAuthentication(); }, [loadAuthentication]);
 
@@ -67,14 +85,19 @@ export default function AppShell() {
   }, []);
 
   useEffect(() => {
-    if (!selectedWorkspace) { setNavigationBadges({}); return; }
+    setNavigationBadges({});
+    if (!authSession || !selectedWorkspace) { setNavigationBadges({}); return; }
     let active = true;
+    let inFlight = false;
+    const controller = new AbortController();
     const loadBadges = async () => {
+      if (inFlight) return;
+      inFlight = true;
       try {
         const [deployments, alerts, gitopsRuns] = await Promise.all([
-          apiGet<Deployment[]>(`/workspaces/${selectedWorkspace}/deployments?limit=100`),
-          apiGet<SloAlert[]>(`/workspaces/${selectedWorkspace}/alerts?limit=100`),
-          apiGet<{ status: string }[]>(`/workspaces/${selectedWorkspace}/gitops-runs?limit=100`),
+          apiGetAll<Deployment>(`/workspaces/${selectedWorkspace}/deployments`, controller.signal),
+          apiGetAll<SloAlert>(`/workspaces/${selectedWorkspace}/alerts`, controller.signal),
+          apiGetAll<{ status: string }>(`/workspaces/${selectedWorkspace}/gitops-runs`, controller.signal),
         ]);
         if (active) setNavigationBadges({
           "/deployments": deployments.filter((item) => ["awaiting_approval", "awaiting_release_approval", "failed"].includes(item.status)).length,
@@ -82,20 +105,21 @@ export default function AppShell() {
         });
       } catch {
         if (active) setNavigationBadges({});
+      } finally {
+        inFlight = false;
       }
     };
     void loadBadges();
-    const timer = window.setInterval(() => void loadBadges(), 30_000);
-    return () => { active = false; window.clearInterval(timer); };
-  }, [selectedWorkspace]);
+    const timer = window.setInterval(() => { if (!document.hidden && !document.querySelector("dialog[open]")) void loadBadges(); }, 30_000);
+    return () => { active = false; controller.abort(); window.clearInterval(timer); };
+  }, [authSession, selectedWorkspace]);
 
   useEffect(() => {
     const onShortcut = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
         event.preventDefault();
-        setSearchOpen(true);
+        if (!document.querySelector("dialog[open]")) setSearchOpen(true);
       }
-      if (event.key === "Escape") setSearchOpen(false);
     };
     window.addEventListener("keydown", onShortcut);
     return () => window.removeEventListener("keydown", onShortcut);
@@ -103,16 +127,19 @@ export default function AppShell() {
 
   useEffect(() => {
     const term = searchText.trim();
+    setServiceSearchResults([]);
+    setDeploymentSearchResults([]);
+    setAlertSearchResults([]);
+    setSearchError("");
+    setResultScope("");
     if (!searchOpen || !selectedWorkspace || term.length < 2) {
-      setServiceSearchResults([]);
-      setDeploymentSearchResults([]);
-      setAlertSearchResults([]);
       setServiceSearchLoading(false);
       return;
     }
     const controller = new AbortController();
+    const scope = `${selectedWorkspace}:${term}`;
+    setServiceSearchLoading(true);
     const timer = window.setTimeout(() => {
-      setServiceSearchLoading(true);
       const params = new URLSearchParams({ search: term, limit: "5" });
       Promise.all([
         apiGet<ServiceCatalog>(`/workspaces/${selectedWorkspace}/services?${params}`, controller.signal),
@@ -120,14 +147,17 @@ export default function AppShell() {
         apiGet<SloAlert[]>(`/workspaces/${selectedWorkspace}/alerts?limit=100`, controller.signal),
       ])
         .then(([services, deployments, alerts]) => {
+          if (controller.signal.aborted) return;
           const normalized = term.toLowerCase();
           setServiceSearchResults(services.items);
           setDeploymentSearchResults(deployments.filter((item) => `${item.version} ${item.source_ref || ""} ${item.id}`.toLowerCase().includes(normalized)).slice(0, 5));
           setAlertSearchResults(alerts.filter((item) => `${item.summary} ${item.status}`.toLowerCase().includes(normalized)).slice(0, 5));
+          setResultScope(scope);
         })
         .catch((error: unknown) => {
-          if (!(error instanceof DOMException && error.name === "AbortError")) {
-            setServiceSearchResults([]); setDeploymentSearchResults([]); setAlertSearchResults([]);
+          if (!controller.signal.aborted) {
+            setSearchError(error instanceof Error ? error.message : "Workspace search could not be loaded. Please try again.");
+            setResultScope(scope);
           }
         })
         .finally(() => { if (!controller.signal.aborted) setServiceSearchLoading(false); });
@@ -154,12 +184,18 @@ export default function AppShell() {
   }
 
   if (authState === "signed-out" || !authSession) {
-    return <AuthGate config={authConfig || { oidc_enabled: false, development_login_enabled: false, authentication_required: true }} errorCode={authErrorCode} onSignedIn={(session) => { setCsrfToken(session.csrf_token); setAuthSession(session); setAuthState("ready"); setAuthErrorCode(undefined); }} />;
+    return <AuthGate config={authConfig || { oidc_enabled: false, development_login_enabled: false, authentication_required: true }} errorCode={authErrorCode} onSignedIn={acceptSession} />;
   }
 
   const visibleNavigation = navigation;
   const visibleItems = visibleNavigation.flatMap((section) => section.items);
   const visibleSearchResults = visibleItems.filter((item) => item.label.toLowerCase().includes(searchText.trim().toLowerCase()));
+  const currentSearchScope = `${selectedWorkspace}:${searchText.trim()}`;
+  const resultsCurrent = resultScope === currentSearchScope;
+  const visibleServices = resultsCurrent ? serviceSearchResults : [];
+  const visibleDeployments = resultsCurrent ? deploymentSearchResults : [];
+  const visibleAlerts = resultsCurrent ? alertSearchResults : [];
+  const searching = Boolean(selectedWorkspace && searchText.trim().length >= 2 && (!resultsCurrent || serviceSearchLoading));
 
   async function signOut() {
     try {
@@ -167,6 +203,8 @@ export default function AppShell() {
     } catch {
       // Clear the local view even if the session has already expired server-side.
     } finally {
+      setSearchOpen(false);
+      setSearchText("");
       setCsrfToken("");
       setAuthSession(null);
       setAuthState("signed-out");
@@ -177,17 +215,18 @@ export default function AppShell() {
 
   return (
     <div className={`app-shell ${collapsed ? "sidebar-collapsed" : ""}`}>
+      <a className="skip-link" href="#workspace-content">Skip to main content</a>
       {mobileOpen && <button className="mobile-scrim" aria-label="Close navigation" onClick={() => setMobileOpen(false)} />}
       <aside className={`sidebar ${mobileOpen ? "mobile-open" : ""}`}>
         <div className="brand-row">
-          <div className="brand-mark" aria-hidden="true"><span>DF</span></div>
+          {collapsed ? <button className="brand-mark brand-expand" type="button" onClick={toggleCollapsed} aria-label="Expand sidebar" title="Expand sidebar"><span>DF</span></button> : <div className="brand-mark" aria-hidden="true"><span>DF</span></div>}
           {!collapsed && <div className="brand-copy"><strong>DeployForge</strong><span>ENTERPRISE PLATFORM</span></div>}
-          <button className="sidebar-toggle" onClick={toggleCollapsed} aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}>
+          {!collapsed && <button className="sidebar-toggle" onClick={toggleCollapsed} aria-label="Collapse sidebar">
             <ChevronLeft size={16} />
-          </button>
+          </button>}
         </div>
 
-        {!collapsed && <div className="workspace-selector-wrap"><WorkspaceSelector /></div>}
+        <div className="workspace-selector-wrap"><WorkspaceSelector /></div>
 
         <nav className="primary-nav" aria-label="Primary navigation">
           {visibleNavigation.map((section) => (
@@ -244,31 +283,31 @@ export default function AppShell() {
           </div>
         </header>
 
-        <div className="page-content"><PlatformProvider session={authSession}><Outlet /></PlatformProvider></div>
+        <div className="page-content" id="workspace-content" tabIndex={-1}><PlatformProvider session={authSession}><Outlet /></PlatformProvider></div>
       </main>
 
       {searchOpen && (
-        <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setSearchOpen(false); }}>
-          <section className="search-dialog" role="dialog" aria-modal="true" aria-label="Search DeployForge pages">
-            <div className="search-dialog-input"><Search size={18} /><input autoFocus value={searchText} onChange={(event) => setSearchText(event.target.value)} placeholder="Search platform pages…" /><button className="icon-button" onClick={() => setSearchOpen(false)} aria-label="Close search"><X size={17} /></button></div>
-            <div className="search-results">
+        <SearchDialog onClose={() => setSearchOpen(false)}>
+            <div className="search-dialog-input"><Search size={18} /><input aria-label="Search pages and workspace resources" value={searchText} onChange={(event) => setSearchText(event.target.value)} placeholder="Search pages and workspace resources…" /><button className="icon-button" onClick={() => setSearchOpen(false)} aria-label="Close search"><X size={17} /></button></div>
+            <div className="search-results" aria-busy={searching}>
               {visibleSearchResults.length > 0 && <div className="search-group-label">Pages</div>}
               {visibleSearchResults.map((item) => {
                 const Icon = item.icon;
                 return <button key={item.path} className="search-result" onClick={() => { navigate(item.path); setSearchOpen(false); setSearchText(""); }}><Icon size={17} /><span><strong>{item.label}</strong><small>{item.description}</small></span></button>;
               })}
               {searchText.trim().length >= 2 && <div className="search-group-label">Services</div>}
-              {serviceSearchResults.map((service) => <button key={service.id} className="search-result" onClick={() => { navigate(`/services?service=${encodeURIComponent(service.id)}`); setSearchOpen(false); setSearchText(""); }}><Boxes size={17} /><span><strong>{service.name}</strong><small>{service.owner_team_name || "Unassigned"} · {service.slug}</small></span></button>)}
-              {deploymentSearchResults.length > 0 && <div className="search-group-label">Deployments</div>}
-              {deploymentSearchResults.map((deployment) => <button key={deployment.id} className="search-result" onClick={() => { navigate("/deployments"); setSearchOpen(false); setSearchText(""); }}><Boxes size={17} /><span><strong>Release {deployment.version}</strong><small>{deployment.source_ref || deployment.id.slice(0, 8)} · {deployment.status}</small></span></button>)}
-              {alertSearchResults.length > 0 && <div className="search-group-label">Reliability alerts</div>}
-              {alertSearchResults.map((alert) => <button key={alert.id} className="search-result" onClick={() => { navigate("/incidents"); setSearchOpen(false); setSearchText(""); }}><Activity size={17} /><span><strong>{alert.summary}</strong><small>{alert.status} · {new Date(alert.created_at).toLocaleString()}</small></span></button>)}
-              {serviceSearchLoading && <div className="search-empty">Searching services…</div>}
-              {visibleSearchResults.length === 0 && serviceSearchResults.length === 0 && deploymentSearchResults.length === 0 && alertSearchResults.length === 0 && !serviceSearchLoading && <div className="search-empty">{searchText.trim().length >= 2 ? "No matching pages or workspace resources." : "Search pages, services, deployments and reliability alerts."}</div>}
+              {visibleServices.map((service) => <button key={service.id} className="search-result" onClick={() => { navigate(`/services?service=${encodeURIComponent(service.id)}`); setSearchOpen(false); setSearchText(""); }}><Boxes size={17} /><span><strong>{service.name}</strong><small>{service.owner_team_name || "Unassigned"} · {service.slug}</small></span></button>)}
+              {visibleDeployments.length > 0 && <div className="search-group-label">Recent deployments</div>}
+              {visibleDeployments.map((deployment) => <button key={deployment.id} className="search-result" onClick={() => { navigate(`/deployments?release=${encodeURIComponent(deployment.id)}`); setSearchOpen(false); setSearchText(""); }}><Boxes size={17} /><span><strong>Release {deployment.version}</strong><small>{deployment.source_ref || deployment.id.slice(0, 8)} · {deployment.status}</small></span></button>)}
+              {visibleAlerts.length > 0 && <div className="search-group-label">Recent reliability alerts</div>}
+              {visibleAlerts.map((alert) => <button key={alert.id} className="search-result" onClick={() => { navigate(`/observability?alert=${encodeURIComponent(alert.id)}`); setSearchOpen(false); setSearchText(""); }}><Activity size={17} /><span><strong>{alert.summary}</strong><small>{alert.status} · {new Date(alert.created_at).toLocaleString()}</small></span></button>)}
+              {searching && <div className="search-empty" role="status">Searching workspace resources…</div>}
+              {resultsCurrent && searchError && <div className="search-empty search-error" role="alert">{searchError}</div>}
+              {!selectedWorkspace && searchText.trim().length >= 2 && <div className="search-empty">Select a workspace to search its resources.</div>}
+              {visibleSearchResults.length === 0 && visibleServices.length === 0 && visibleDeployments.length === 0 && visibleAlerts.length === 0 && !searching && !searchError && (selectedWorkspace || searchText.trim().length < 2) && <div className="search-empty">{searchText.trim().length >= 2 ? "No matching pages or workspace resources." : "Search pages, services, deployments and reliability alerts."}</div>}
             </div>
-            <div className="search-dialog-footer">Search pages and live resources in the selected workspace</div>
-          </section>
-        </div>
+            <div className="search-dialog-footer">Pages, service catalog and the newest 100 releases and alerts · Esc to close</div>
+        </SearchDialog>
       )}
       {mobileOpen && <button className="mobile-close" onClick={() => setMobileOpen(false)} aria-label="Close navigation"><X size={18} /></button>}
     </div>
