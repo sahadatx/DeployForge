@@ -132,6 +132,12 @@ jobs:
           fail-build: true
           severity-cutoff: high
 
+      - name: Prepare an immutable Grype result claim
+        env:
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+          VULNERABILITY_REPORT_PATH: grype.json
+        run: python3 examples/demo-service/scripts/report-build.py --prepare-scanner-predicate
+
       - name: Install Cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
         with:
@@ -159,6 +165,16 @@ jobs:
           subject-name: ${{ steps.source.outputs.image }}
           subject-digest: ${{ steps.image.outputs.digest }}
           sbom-path: demo-service.cdx.json
+          push-to-registry: true
+
+      - name: Attest the Grype vulnerability result
+        id: vulnerability-attestation
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-name: ${{ steps.source.outputs.image }}
+          subject-digest: ${{ steps.image.outputs.digest }}
+          predicate-type: https://deployforge.dev/attestations/grype/v1
+          predicate-path: vulnerability.predicate.json
           push-to-registry: true
 
       - name: Prepare the immutable staging GitOps revision
@@ -203,9 +219,11 @@ jobs:
           IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
           PROVENANCE_URI: ${{ steps.provenance.outputs.attestation-url }}
           SBOM_URI: ${{ steps.sbom-attestation.outputs.attestation-url }}
+          VULNERABILITY_URI: ${{ steps.vulnerability-attestation.outputs.attestation-url }}
           SIGNATURE_BUNDLE_PATH: image.sigstore.json
           PROVENANCE_BUNDLE_PATH: ${{ steps.provenance.outputs.bundle-path }}
           SBOM_BUNDLE_PATH: ${{ steps.sbom-attestation.outputs.bundle-path }}
+          VULNERABILITY_BUNDLE_PATH: ${{ steps.vulnerability-attestation.outputs.bundle-path }}
           SBOM_PATH: demo-service.cdx.json
           VULNERABILITY_REPORT_PATH: grype.json
           DEPLOYFORGE_CALLBACK_ALLOWED_HOST: ${{ vars.DEPLOYFORGE_CALLBACK_ALLOWED_HOST }}

@@ -2,6 +2,8 @@
 
 DeployForge uses Argo CD as the Kubernetes reconciliation boundary. A successful CI callback creates a durable GitOps run for the service and environment target. The source commit identifies the code used to build the image; `gitops_revision` identifies the manifest commit containing the image digest. The worker asks Argo CD to sync the manifest revision, then polls the Application until that exact revision is `Synced` and `Healthy`.
 
+For weighted canaries and metric-gated promotion, see the [progressive delivery guide](../operations/progressive-delivery.md). Argo Rollouts owns the workload stages; DeployForge waits for the parent Argo CD Application to become healthy and retains the release-level approval and rollback history.
+
 ## Configure the provider
 
 Set these values for both the API and worker. Compose maps them from the root `.env` file:
@@ -49,7 +51,25 @@ X-CSRF-Token: <session CSRF token>
 - `POST /api/v1/workspaces/{workspace_id}/gitops-runs/{gitops_run_id}/retry` requeues a blocked run after its target or provider configuration is fixed.
 - `POST /api/v1/workspaces/{workspace_id}/deployments/{deployment_id}/rollback` queues an audited rollback to the prior healthy revision for the target's latest deployment.
 
-The worker stores each state transition and audit event. A release is marked successful only after the observed revision exactly matches the requested GitOps manifest commit and Argo CD reports `Synced` plus `Healthy`. Timeout or degraded health fails the run; when an earlier healthy revision exists, DeployForge queues an automatic rollback and only marks the deployment rolled back after Argo CD verifies that revision. A provider outage is exposed as disconnected/retryable state; no success is inferred from the sync request response alone.
+The worker stores each state transition and audit event. A release is marked successful only after the observed revision exactly matches the requested GitOps manifest commit and Argo CD reports `Synced` plus `Healthy`. When verified supply-chain mode is enabled, OCI releases must also appear in Argo CD's live `status.summary.images` with the exact artifact repository and digest. A mismatch fails the release and queues a rollback when an earlier healthy revision exists. Timeout or degraded health follows the same recovery path. A provider outage is exposed as disconnected/retryable state; no success is inferred from the sync request response alone.
+
+## Promote the same artifact across environments
+
+`GET /api/v1/workspaces/{workspace_id}/promotion-artifacts?service_id=<uuid>&environment_id=<uuid>` lists container artifacts from successful deployments of that service in a different environment. The source deployment must have a successful Argo CD deploy run; when verified supply-chain mode is enabled, the artifact must also have independently verified evidence. Promotion is rejected if the artifact differs from the registered target's configured `artifact_name`.
+
+Create the release with the artifact ID and an immutable target manifest commit:
+
+```json
+{
+  "service_id": "<service UUID>",
+  "environment_id": "<target environment UUID>",
+  "version": "v2.8.1",
+  "artifact_id": "<eligible artifact UUID>",
+  "gitops_revision": "<40–64 lowercase hexadecimal commit SHA>"
+}
+```
+
+The normal independent release approval still applies. After approval, DeployForge creates a promotion build record by copying the source artifact evidence without dispatching CI, then reevaluates the target environment's policies. Policy denials or a second approval requirement are honored. Argo CD must sync the supplied target revision and report it healthy; in verified supply-chain mode, the live image summary must also contain the exact promoted OCI digest before the release succeeds.
 
 DeployForge currently disables pruning on sync requests and does not delete resources as part of a release. The adapter supports single-source Applications; multi-source Applications and ApplicationSet-specific operations are outside this integration boundary. Health is based on the health status Argo CD reports for the Application and its configured resources; review the [Argo CD health assessment documentation](https://argo-cd.readthedocs.io/en/latest/operator-manual/health/) when defining custom resource health checks.
 

@@ -1,0 +1,61 @@
+{{- if .Values.monitoring.prometheusRule.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "deployforge.fullname" . }}
+  namespace: {{ default .Release.Namespace .Values.monitoring.prometheusRule.namespace }}
+  labels:
+    {{- include "deployforge.labels" . | nindent 4 }}
+    {{- with .Values.monitoring.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: deployforge.availability
+      rules:
+        - alert: DeployForgeApiUnavailable
+          expr: up{service="{{ include "deployforge.fullname" . }}-api",namespace="{{ .Release.Namespace }}"} == 0
+          for: 2m
+          labels:
+            severity: critical
+            service: deployforge
+          annotations:
+            summary: DeployForge API scrape is failing
+            description: Prometheus has failed to scrape the DeployForge API for more than two minutes.
+        - alert: DeployForgeNoActiveWorkers
+          expr: deployforge_active_workers{namespace="{{ .Release.Namespace }}"} < 1
+          for: 2m
+          labels:
+            severity: critical
+            service: deployforge
+          annotations:
+            summary: DeployForge has no healthy workers
+            description: No worker heartbeat has been fresh for at least two minutes.
+        - alert: DeployForgeJobQueueBacklog
+          expr: sum by (kind) (deployforge_job_queue_depth{namespace="{{ .Release.Namespace }}",status=~"queued|apply_queued"}) > 25
+          for: 5m
+          labels:
+            severity: warning
+            service: deployforge
+          annotations:
+            summary: DeployForge {{`{{ $labels.kind }}`}} queue is backing up
+            description: More than 25 queued jobs have remained pending for five minutes.
+        - alert: DeployForgeJobQueueAgeHigh
+          expr: deployforge_job_queue_oldest_age_seconds{namespace="{{ .Release.Namespace }}"} > 300
+          for: 5m
+          labels:
+            severity: warning
+            service: deployforge
+          annotations:
+            summary: DeployForge {{`{{ $labels.kind }}`}} queue has old jobs
+            description: The oldest waiting job has been pending for more than five minutes.
+        - alert: DeployForgeSloAlertsFiring
+          expr: deployforge_active_slo_alerts{namespace="{{ .Release.Namespace }}"} > 0
+          for: 1m
+          labels:
+            severity: warning
+            service: deployforge
+          annotations:
+            summary: DeployForge has active SLO alerts
+            description: One or more service SLO alerts are firing or awaiting acknowledgement.
+{{- end }}

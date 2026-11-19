@@ -1,0 +1,19 @@
+{{- range $component := list "dashboard" }}
+{{- $config := index $.Values.podDisruptionBudget $component }}
+{{- if $config.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "deployforge.fullname" $ }}-{{ $component }}
+  labels:
+    {{- include "deployforge.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: {{ $component }}
+spec:
+  minAvailable: {{ $config.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "deployforge.selectorLabels" $ | nindent 6 }}
+      app.kubernetes.io/component: {{ $component }}
+{{- end }}
+{{- end }}

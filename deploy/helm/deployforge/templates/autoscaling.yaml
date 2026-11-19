@@ -1,0 +1,40 @@
+{{- range $component := list "dashboard" }}
+{{- $config := index $.Values.autoscaling $component }}
+{{- if $config.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "deployforge.fullname" $ }}-{{ $component }}
+  labels:
+    {{- include "deployforge.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: {{ $component }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "deployforge.fullname" $ }}-{{ $component }}
+  minReplicas: {{ $config.minReplicas }}
+  maxReplicas: {{ $config.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ $config.targetCPUUtilizationPercentage }}
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 60
+{{- end }}
+{{- end }}

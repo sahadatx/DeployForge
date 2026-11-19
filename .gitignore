@@ -20,6 +20,9 @@ dist/
 *.tsbuildinfo
 .coverage
 coverage/
+.playwright/
+playwright-report/
+test-results/
 .DS_Store
 .idea/
 .vscode/

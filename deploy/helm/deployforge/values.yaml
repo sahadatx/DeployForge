@@ -7,13 +7,13 @@ images:
     tag: "0.1.0"
     digest: ""
     pullPolicy: IfNotPresent
-  worker:
-    repository: ghcr.io/sahadatx/deployforge-api
+  dashboard:
+    repository: ghcr.io/sahadatx/deployforge-dashboard
     tag: "0.1.0"
     digest: ""
     pullPolicy: IfNotPresent
-  dashboard:
-    repository: ghcr.io/sahadatx/deployforge-dashboard
+  apkParser:
+    repository: ghcr.io/sahadatx/deployforge-apk-parser
     tag: "0.1.0"
     digest: ""
     pullPolicy: IfNotPresent
@@ -27,30 +27,21 @@ serviceAccount:
 replicas:
   api: 2
   worker: 2
-  dashboard: 1
+  dashboard: 2
 
 autoscaling:
-  api:
-    enabled: true
-    minReplicas: 2
-    maxReplicas: 8
-    targetCPUUtilizationPercentage: 70
-  worker:
-    enabled: true
-    minReplicas: 2
-    maxReplicas: 12
-    targetCPUUtilizationPercentage: 70
+  api: { enabled: true, minReplicas: 2, maxReplicas: 8, targetCPUUtilizationPercentage: 70 }
+  worker: { enabled: true, minReplicas: 2, maxReplicas: 12, targetCPUUtilizationPercentage: 70 }
+  dashboard: { enabled: true, minReplicas: 2, maxReplicas: 6, targetCPUUtilizationPercentage: 75 }
 
 podDisruptionBudget:
-  api:
-    enabled: true
-    minAvailable: 1
-  worker:
-    enabled: true
-    minAvailable: 1
+  api: { enabled: true, minAvailable: 1 }
+  worker: { enabled: true, minAvailable: 1 }
+  dashboard: { enabled: true, minAvailable: 1 }
 
 database:
-  # Supply a managed PostgreSQL URL through the cluster secret manager.
+  # DeployForge does not install a database; use managed HA PostgreSQL with TLS,
+  # PITR, connection limits, and a least-privilege application account.
   existingSecret: deployforge-runtime
   urlKey: database_url
   pool:
@@ -69,10 +60,16 @@ secrets:
   keys:
     sessionSecret: session_secret
     oidcClientSecret: oidc_client_secret
-    scimBearerToken: scim_bearer_token
     buildCallbackSecret: build_callback_secret
     githubActionsToken: github_actions_token
+    gitlabBuildToken: gitlab_build_token
+    azureDevOpsBuildToken: azure_devops_build_token
+    githubRepositoryToken: github_repository_token
     argocdAuthToken: argocd_auth_token
+    fluxAuthToken: flux_auth_token
+    argoRolloutsAuthToken: argo_rollouts_auth_token
+    scimBearerToken: scim_bearer_token
+    pagerDutyRoutingKey: pagerduty_routing_key
 
 config:
   buildProvider: github_actions
@@ -84,25 +81,61 @@ config:
     discoveryUrl: https://identity.example.com/.well-known/openid-configuration
     clientId: deployforge
     redirectUri: https://deployforge.example.com/api/v1/auth/callback
-    scimExternalIdClaim: employeeNumber
+    adminEmails: ""
     groupClaim: groups
+    scimExternalIdClaim: employeeNumber
     groupRoleMappings: "{}"
   scim:
     enabled: false
   github:
     enabled: false
-    apiUrl: https://api.github.com
     serverUrl: https://github.com
+    apiUrl: https://api.github.com
     workflowPath: .github/workflows/deployforge-build.yml
     infrastructureWorkflowPath: .github/workflows/deployforge-infrastructure.yml
     callbackPublicUrl: https://deployforge.example.com
     callbackTimeoutSeconds: 14400
+    repositoryProvisioning:
+      enabled: false
+      owner: ""
+      templates: "{}"
+      private: true
+  gitlab:
+    serverUrl: ""
+    apiUrl: ""
+    ciConfigPath: .gitlab-ci.yml
+  azureDevOps:
+    organizationUrl: ""
+    oidcIssuer: ""
+    pipelineIds: "{}"
   argocd:
     enabled: false
     apiUrl: ""
     apiTimeoutSeconds: 15
     syncTimeoutSeconds: 1800
     reconcileIntervalSeconds: 10
+  flux:
+    enabled: false
+    apiUrl: ""
+    clusterName: ""
+    apiTimeoutSeconds: 15
+  argoRollouts:
+    enabled: false
+    apiUrl: ""
+    apiTimeoutSeconds: 15
+  pagerduty:
+    enabled: false
+  apkParser:
+    url: ""
+    timeoutSeconds: 120
+  supplyChain:
+    requireVerified: true
+    maxCriticalVulnerabilities: 0
+    maxHighVulnerabilities: 0
+    oidcIssuer: https://token.actions.githubusercontent.com
+    trustedRootFile: ""
+    trustedRootSha256: ""
+  requireVerifiedApprovalIdentity: true
   workerHeartbeatIntervalSeconds: 10
   workerHeartbeatStaleAfterSeconds: 30
   telemetryRetentionDays: 31
@@ -111,6 +144,14 @@ config:
     otlpTracesEndpoint: ""
     otlpMetricsEndpoint: ""
     otlpHeaders: ""
+
+runtimeSecretMounts: []
+
+apkParser:
+  enabled: false
+  resources:
+    requests: { cpu: 250m, memory: 256Mi }
+    limits: { cpu: "1", memory: 768Mi }
 
 resources:
   api:
@@ -179,11 +220,31 @@ auditExport:
 ingress:
   enabled: false
   className: nginx
-  annotations: {}
+  annotations:
+    nginx.ingress.kubernetes.io/limit-rps: "20"
+    nginx.ingress.kubernetes.io/limit-burst-multiplier: "2"
+    nginx.ingress.kubernetes.io/proxy-body-size: "65m"
   host: deployforge.example.com
   tls:
     enabled: true
     secretName: deployforge-tls
+
+networkPolicy:
+  enabled: false
+  # Supply egress rules for the managed database, ingress controller, IdP,
+  # GitHub, Argo CD, Flux Kubernetes API, and telemetry collector before enabling.
+  egress: []
+
+monitoring:
+  serviceMonitor:
+    enabled: false
+    namespace: ""
+    interval: 30s
+    labels: {}
+  prometheusRule:
+    enabled: false
+    namespace: ""
+    labels: {}
 
 nodeSelector: {}
 tolerations: []

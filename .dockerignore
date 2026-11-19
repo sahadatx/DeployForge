@@ -1,0 +1,15 @@
+**
+!backend/
+!backend/requirements.txt
+!backend/app/
+!backend/app/**
+!deploy/
+!deploy/backup/
+!deploy/audit-exporter/
+!deploy/audit-exporter/Dockerfile
+!deploy/backup/Dockerfile
+!scripts/
+!scripts/lib/
+!scripts/backup-postgres-offsite.sh
+!scripts/export-audit-events.py
+!scripts/lib/postgres-url-to-env.py

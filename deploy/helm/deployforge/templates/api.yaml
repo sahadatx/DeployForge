@@ -27,6 +27,8 @@ spec:
       serviceAccountName: {{ include "deployforge.serviceAccountName" . }}
       automountServiceAccountToken: false
       terminationGracePeriodSeconds: 30
+      {{- include "deployforge.imagePullSecrets" . | nindent 6 }}
+      {{- include "deployforge.podSecurityContext" . | nindent 6 }}
       topologySpreadConstraints:
         - maxSkew: 1
           topologyKey: topology.kubernetes.io/zone
@@ -42,37 +44,16 @@ spec:
             matchLabels:
               {{- include "deployforge.selectorLabels" . | nindent 14 }}
               app.kubernetes.io/component: api
-      {{- include "deployforge.imagePullSecrets" . | nindent 6 }}
-      {{- include "deployforge.podSecurityContext" . | nindent 6 }}
       containers:
         - name: api
           image: "{{- if .Values.images.api.digest }}{{ .Values.images.api.repository }}@{{ .Values.images.api.digest }}{{- else }}{{ .Values.images.api.repository }}:{{ .Values.images.api.tag }}{{- end }}"
           imagePullPolicy: {{ .Values.images.api.pullPolicy }}
-          {{- include "deployforge.containerSecurityContext" . | nindent 10 }}
           command: ["uvicorn"]
           args: ["app.main:app", "--host", "0.0.0.0", "--port", "8000"]
           ports:
             - name: http
               containerPort: 8000
               protocol: TCP
-          startupProbe:
-            httpGet:
-              path: /api/v1/health/ready
-              port: http
-            failureThreshold: 30
-            periodSeconds: 5
-          readinessProbe:
-            httpGet:
-              path: /api/v1/health/ready
-              port: http
-            periodSeconds: 10
-            timeoutSeconds: 3
-          livenessProbe:
-            httpGet:
-              path: /api/v1/health/live
-              port: http
-            periodSeconds: 20
-            timeoutSeconds: 3
           env:
             - name: DEPLOYFORGE_APP_ENV
               value: production
@@ -105,19 +86,14 @@ spec:
                   key: {{ .Values.secrets.keys.oidcClientSecret | quote }}
             - name: DEPLOYFORGE_OIDC_REDIRECT_URI
               value: {{ .Values.config.oidc.redirectUri | quote }}
-            - name: DEPLOYFORGE_OIDC_SCIM_EXTERNAL_ID_CLAIM
-              value: {{ .Values.config.oidc.scimExternalIdClaim | quote }}
+            - name: DEPLOYFORGE_OIDC_ADMIN_EMAILS
+              value: {{ .Values.config.oidc.adminEmails | quote }}
             - name: DEPLOYFORGE_OIDC_GROUP_CLAIM
               value: {{ .Values.config.oidc.groupClaim | quote }}
+            - name: DEPLOYFORGE_OIDC_SCIM_EXTERNAL_ID_CLAIM
+              value: {{ .Values.config.oidc.scimExternalIdClaim | quote }}
             - name: DEPLOYFORGE_OIDC_GROUP_ROLE_MAPPINGS
               value: {{ .Values.config.oidc.groupRoleMappings | quote }}
-            {{- if .Values.config.scim.enabled }}
-            - name: DEPLOYFORGE_SCIM_BEARER_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .Values.secrets.existingSecret | quote }}
-                  key: {{ .Values.secrets.keys.scimBearerToken | quote }}
-            {{- end }}
             - name: DEPLOYFORGE_FRONTEND_BASE_URL
               value: {{ .Values.config.frontendBaseUrl | quote }}
             - name: DEPLOYFORGE_BUILD_CALLBACK_SECRET
@@ -125,38 +101,156 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.secrets.existingSecret | quote }}
                   key: {{ .Values.secrets.keys.buildCallbackSecret | quote }}
-            - name: DEPLOYFORGE_GITHUB_ACTIONS_WORKFLOW_PATH
-              value: {{ .Values.config.github.workflowPath | quote }}
-            - name: DEPLOYFORGE_INFRASTRUCTURE_WORKFLOW_PATH
-              value: {{ .Values.config.github.infrastructureWorkflowPath | quote }}
+            {{ if .Values.config.scim.enabled }}
+            - name: DEPLOYFORGE_SCIM_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.existingSecret | quote }}
+                  key: {{ .Values.secrets.keys.scimBearerToken | quote }}
+            {{ end }}
             - name: DEPLOYFORGE_BUILD_CALLBACK_PUBLIC_URL
               value: {{ .Values.config.github.callbackPublicUrl | quote }}
             - name: DEPLOYFORGE_BUILD_CALLBACK_TIMEOUT_SECONDS
               value: {{ .Values.config.github.callbackTimeoutSeconds | quote }}
-          {{- with .Values.resources.api }}
+            - name: DEPLOYFORGE_GITHUB_API_URL
+              value: {{ .Values.config.github.apiUrl | quote }}
+            - name: DEPLOYFORGE_GITHUB_SERVER_URL
+              value: {{ .Values.config.github.serverUrl | quote }}
+            - name: DEPLOYFORGE_GITHUB_ACTIONS_WORKFLOW_PATH
+              value: {{ .Values.config.github.workflowPath | quote }}
+            - name: DEPLOYFORGE_GITLAB_SERVER_URL
+              value: {{ .Values.config.gitlab.serverUrl | quote }}
+            - name: DEPLOYFORGE_GITLAB_API_URL
+              value: {{ .Values.config.gitlab.apiUrl | quote }}
+            - name: DEPLOYFORGE_GITLAB_CI_CONFIG_PATH
+              value: {{ .Values.config.gitlab.ciConfigPath | quote }}
+            - name: DEPLOYFORGE_AZURE_DEVOPS_ORGANIZATION_URL
+              value: {{ .Values.config.azureDevOps.organizationUrl | quote }}
+            - name: DEPLOYFORGE_AZURE_DEVOPS_OIDC_ISSUER
+              value: {{ .Values.config.azureDevOps.oidcIssuer | quote }}
+            - name: DEPLOYFORGE_AZURE_DEVOPS_PIPELINE_IDS
+              value: {{ .Values.config.azureDevOps.pipelineIds | quote }}
+            - name: DEPLOYFORGE_INFRASTRUCTURE_WORKFLOW_PATH
+              value: {{ .Values.config.github.infrastructureWorkflowPath | quote }}
+            - name: DEPLOYFORGE_REQUIRE_VERIFIED_SUPPLY_CHAIN
+              value: {{ .Values.config.supplyChain.requireVerified | quote }}
+            - name: DEPLOYFORGE_SIGSTORE_OIDC_ISSUER
+              value: {{ .Values.config.supplyChain.oidcIssuer | quote }}
+            - name: DEPLOYFORGE_SIGSTORE_TRUSTED_ROOT_FILE
+              value: {{ .Values.config.supplyChain.trustedRootFile | quote }}
+            - name: DEPLOYFORGE_SIGSTORE_TRUSTED_ROOT_SHA256
+              value: {{ .Values.config.supplyChain.trustedRootSha256 | quote }}
+            - name: DEPLOYFORGE_APK_PARSER_URL
+              value: {{ if .Values.apkParser.enabled }}{{ .Values.config.apkParser.url | default (printf "http://%s-apk-parser:8100" (include "deployforge.fullname" .)) | quote }}{{ else }}""{{ end }}
+            - name: DEPLOYFORGE_APK_PARSER_TIMEOUT_SECONDS
+              value: {{ .Values.config.apkParser.timeoutSeconds | quote }}
+            - name: DEPLOYFORGE_BUILD_MAX_CRITICAL_VULNERABILITIES
+              value: {{ .Values.config.supplyChain.maxCriticalVulnerabilities | quote }}
+            - name: DEPLOYFORGE_BUILD_MAX_HIGH_VULNERABILITIES
+              value: {{ .Values.config.supplyChain.maxHighVulnerabilities | quote }}
+            - name: DEPLOYFORGE_REQUIRE_VERIFIED_APPROVAL_IDENTITY
+              value: {{ .Values.config.requireVerifiedApprovalIdentity | quote }}
+            - name: DEPLOYFORGE_DEV_AUTH_ENABLED
+              value: "false"
+            - name: DEPLOYFORGE_DEV_AUTH_AUTO_ADMIN_FIRST_USER
+              value: "false"
+            - name: DEPLOYFORGE_WORKER_HEARTBEAT_INTERVAL_SECONDS
+              value: {{ .Values.config.workerHeartbeatIntervalSeconds | quote }}
+            - name: DEPLOYFORGE_WORKER_HEARTBEAT_STALE_AFTER_SECONDS
+              value: {{ .Values.config.workerHeartbeatStaleAfterSeconds | quote }}
+            - name: DEPLOYFORGE_TELEMETRY_RETENTION_DAYS
+              value: {{ .Values.config.telemetryRetentionDays | quote }}
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: {{ .Values.config.telemetry.otlpEndpoint | quote }}
+            - name: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
+              value: {{ .Values.config.telemetry.otlpTracesEndpoint | quote }}
+            - name: OTEL_EXPORTER_OTLP_METRICS_ENDPOINT
+              value: {{ .Values.config.telemetry.otlpMetricsEndpoint | quote }}
+            - name: OTEL_EXPORTER_OTLP_HEADERS
+              value: {{ .Values.config.telemetry.otlpHeaders | quote }}
+          {{ if .Values.config.github.repositoryProvisioning.enabled }}
+            - name: DEPLOYFORGE_GITHUB_REPOSITORY_OWNER
+              value: {{ .Values.config.github.repositoryProvisioning.owner | quote }}
+            - name: DEPLOYFORGE_GITHUB_REPOSITORY_TEMPLATES
+              value: {{ .Values.config.github.repositoryProvisioning.templates | quote }}
+            - name: DEPLOYFORGE_GITHUB_REPOSITORY_PRIVATE
+              value: {{ .Values.config.github.repositoryProvisioning.private | quote }}
+          {{ end }}
+          {{ if .Values.config.argocd.enabled }}
+            - name: DEPLOYFORGE_ARGOCD_API_URL
+              value: {{ .Values.config.argocd.apiUrl | quote }}
+            - name: DEPLOYFORGE_ARGOCD_API_TIMEOUT_SECONDS
+              value: {{ .Values.config.argocd.apiTimeoutSeconds | quote }}
+            - name: DEPLOYFORGE_GITOPS_SYNC_TIMEOUT_SECONDS
+              value: {{ .Values.config.argocd.syncTimeoutSeconds | quote }}
+            - name: DEPLOYFORGE_GITOPS_RECONCILE_INTERVAL_SECONDS
+              value: {{ .Values.config.argocd.reconcileIntervalSeconds | quote }}
+          {{ end }}
+          {{ if .Values.config.flux.enabled }}
+            - name: DEPLOYFORGE_FLUX_API_URL
+              value: {{ .Values.config.flux.apiUrl | quote }}
+            - name: DEPLOYFORGE_FLUX_CLUSTER_NAME
+              value: {{ .Values.config.flux.clusterName | quote }}
+            - name: DEPLOYFORGE_FLUX_API_TIMEOUT_SECONDS
+              value: {{ .Values.config.flux.apiTimeoutSeconds | quote }}
+          {{ end }}
+          {{ if .Values.config.argoRollouts.enabled }}
+            - name: DEPLOYFORGE_ARGO_ROLLOUTS_API_URL
+              value: {{ .Values.config.argoRollouts.apiUrl | quote }}
+            - name: DEPLOYFORGE_ARGO_ROLLOUTS_API_TIMEOUT_SECONDS
+              value: {{ .Values.config.argoRollouts.apiTimeoutSeconds | quote }}
+          {{ end }}
+          {{- include "deployforge.containerSecurityContext" . | nindent 10 }}
           resources:
-            {{- toYaml . | nindent 12 }}
-          {{- end }}
-          {{- if .Values.database.tls.enabled }}
+            {{- toYaml .Values.resources.api | nindent 12 }}
           volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.database.tls.enabled }}
             {{- include "deployforge.databaseVolumeMounts" . | nindent 12 }}
-          {{- end }}
-      {{- if .Values.database.tls.enabled }}
+            {{- end }}
+          {{ if .Values.runtimeSecretMounts }}
+            - name: runtime-secrets
+              mountPath: /run/secrets
+              readOnly: true
+          {{ end }}
+          startupProbe:
+            httpGet:
+              path: /api/v1/health/ready
+              port: http
+            failureThreshold: 30
+            periodSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /api/v1/health/ready
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /api/v1/health/live
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 3
       volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 128Mi
+        {{- if .Values.database.tls.enabled }}
         {{- include "deployforge.databaseVolumes" . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.nodeSelector }}
+        {{- end }}
+        {{ if .Values.runtimeSecretMounts }}
+        - name: runtime-secrets
+          projected:
+            sources:
+              {{- toYaml .Values.runtimeSecretMounts | nindent 14 }}
+        {{ end }}
       nodeSelector:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.affinity }}
-      affinity:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.tolerations }}
+        {{- toYaml .Values.nodeSelector | nindent 8 }}
       tolerations:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
+        {{- toYaml .Values.tolerations | nindent 8 }}
+      affinity:
+        {{- toYaml .Values.affinity | nindent 8 }}
 ---
 apiVersion: v1
 kind: Service
@@ -167,11 +261,11 @@ metadata:
     app.kubernetes.io/component: api
 spec:
   type: ClusterIP
+  selector:
+    {{- include "deployforge.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: api
   ports:
     - name: http
       port: 8000
       targetPort: http
       protocol: TCP
-  selector:
-    {{- include "deployforge.selectorLabels" . | nindent 4 }}
-    app.kubernetes.io/component: api

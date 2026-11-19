@@ -33,7 +33,7 @@ if [ ! -s "$secret_dir/database_url" ] || [ "$new_app_database_password" -eq 1 ]
 fi
 
 # These are mounted only into the API or worker when configured. Fill OIDC before startup.
-for optional_secret in oidc_client_secret github_actions_token argocd_auth_token; do
+for optional_secret in oidc_client_secret github_actions_token gitlab_build_token azure_devops_build_token argocd_auth_token flux_auth_token sigstore_trusted_root.json; do
     if [ ! -e "$secret_dir/$optional_secret" ]; then
         : > "$secret_dir/$optional_secret"
     fi

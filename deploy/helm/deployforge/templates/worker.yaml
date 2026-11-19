@@ -12,7 +12,7 @@ spec:
   strategy:
     type: RollingUpdate
     rollingUpdate:
-      maxUnavailable: 0
+      maxUnavailable: 1
       maxSurge: 1
   selector:
     matchLabels:
@@ -46,11 +46,9 @@ spec:
               app.kubernetes.io/component: worker
       containers:
         - name: worker
-          image: "{{- if .Values.images.worker.digest }}{{ .Values.images.worker.repository }}@{{ .Values.images.worker.digest }}{{- else }}{{ .Values.images.worker.repository }}:{{ .Values.images.worker.tag }}{{- end }}"
-          imagePullPolicy: {{ .Values.images.worker.pullPolicy }}
-          {{- include "deployforge.containerSecurityContext" . | nindent 10 }}
-          command: ["python"]
-          args: ["-m", "app.worker"]
+          image: "{{- if .Values.images.api.digest }}{{ .Values.images.api.repository }}@{{ .Values.images.api.digest }}{{- else }}{{ .Values.images.api.repository }}:{{ .Values.images.api.tag }}{{- end }}"
+          imagePullPolicy: {{ .Values.images.api.pullPolicy }}
+          command: ["python", "-m", "app.worker"]
           env:
             - name: DEPLOYFORGE_APP_ENV
               value: production
@@ -60,79 +58,151 @@ spec:
               value: {{ .Values.config.buildProvider | quote }}
             - name: DEPLOYFORGE_LOG_LEVEL
               value: {{ .Values.config.logLevel | quote }}
+            - name: DEPLOYFORGE_FRONTEND_BASE_URL
+              value: {{ .Values.config.frontendBaseUrl | quote }}
             {{- include "deployforge.databaseEnv" . | nindent 12 }}
+            - name: DEPLOYFORGE_GITHUB_API_URL
+              value: {{ .Values.config.github.apiUrl | quote }}
+            - name: DEPLOYFORGE_GITHUB_SERVER_URL
+              value: {{ .Values.config.github.serverUrl | quote }}
+            - name: DEPLOYFORGE_GITHUB_ACTIONS_WORKFLOW_PATH
+              value: {{ .Values.config.github.workflowPath | quote }}
+            - name: DEPLOYFORGE_GITLAB_SERVER_URL
+              value: {{ .Values.config.gitlab.serverUrl | quote }}
+            - name: DEPLOYFORGE_GITLAB_API_URL
+              value: {{ .Values.config.gitlab.apiUrl | quote }}
+            - name: DEPLOYFORGE_GITLAB_CI_CONFIG_PATH
+              value: {{ .Values.config.gitlab.ciConfigPath | quote }}
+            - name: DEPLOYFORGE_AZURE_DEVOPS_ORGANIZATION_URL
+              value: {{ .Values.config.azureDevOps.organizationUrl | quote }}
+            - name: DEPLOYFORGE_AZURE_DEVOPS_OIDC_ISSUER
+              value: {{ .Values.config.azureDevOps.oidcIssuer | quote }}
+            - name: DEPLOYFORGE_AZURE_DEVOPS_PIPELINE_IDS
+              value: {{ .Values.config.azureDevOps.pipelineIds | quote }}
+            - name: DEPLOYFORGE_INFRASTRUCTURE_WORKFLOW_PATH
+              value: {{ .Values.config.github.infrastructureWorkflowPath | quote }}
+            - name: DEPLOYFORGE_BUILD_CALLBACK_PUBLIC_URL
+              value: {{ .Values.config.github.callbackPublicUrl | quote }}
+            - name: DEPLOYFORGE_BUILD_CALLBACK_TIMEOUT_SECONDS
+              value: {{ .Values.config.github.callbackTimeoutSeconds | quote }}
             - name: DEPLOYFORGE_BUILD_CALLBACK_SECRET
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.secrets.existingSecret | quote }}
                   key: {{ .Values.secrets.keys.buildCallbackSecret | quote }}
-            - name: DEPLOYFORGE_BUILD_CALLBACK_PUBLIC_URL
-              value: {{ .Values.config.github.callbackPublicUrl | quote }}
-            - name: DEPLOYFORGE_BUILD_CALLBACK_TIMEOUT_SECONDS
-              value: {{ .Values.config.github.callbackTimeoutSeconds | quote }}
             - name: DEPLOYFORGE_WORKER_HEARTBEAT_INTERVAL_SECONDS
               value: {{ .Values.config.workerHeartbeatIntervalSeconds | quote }}
             - name: DEPLOYFORGE_WORKER_HEARTBEAT_STALE_AFTER_SECONDS
               value: {{ .Values.config.workerHeartbeatStaleAfterSeconds | quote }}
             - name: DEPLOYFORGE_TELEMETRY_RETENTION_DAYS
               value: {{ .Values.config.telemetryRetentionDays | quote }}
-          {{- if .Values.config.github.enabled }}
-            - name: DEPLOYFORGE_GITHUB_API_URL
-              value: {{ .Values.config.github.apiUrl | quote }}
-            - name: DEPLOYFORGE_GITHUB_SERVER_URL
-              value: {{ .Values.config.github.serverUrl | quote }}
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: {{ .Values.config.telemetry.otlpEndpoint | quote }}
+            - name: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
+              value: {{ .Values.config.telemetry.otlpTracesEndpoint | quote }}
+            - name: OTEL_EXPORTER_OTLP_METRICS_ENDPOINT
+              value: {{ .Values.config.telemetry.otlpMetricsEndpoint | quote }}
+            - name: OTEL_EXPORTER_OTLP_HEADERS
+              value: {{ .Values.config.telemetry.otlpHeaders | quote }}
+          {{ if .Values.config.github.enabled }}
             - name: DEPLOYFORGE_GITHUB_ACTIONS_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.secrets.existingSecret | quote }}
                   key: {{ .Values.secrets.keys.githubActionsToken | quote }}
-          {{- end }}
-          {{- if .Values.config.argocd.enabled }}
+          {{ end }}
+          {{ if eq .Values.config.buildProvider "gitlab_ci" }}
+            - name: DEPLOYFORGE_GITLAB_BUILD_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.existingSecret | quote }}
+                  key: {{ .Values.secrets.keys.gitlabBuildToken | quote }}
+          {{ end }}
+          {{ if eq .Values.config.buildProvider "azure_devops" }}
+            - name: DEPLOYFORGE_AZURE_DEVOPS_BUILD_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.existingSecret | quote }}
+                  key: {{ .Values.secrets.keys.azureDevOpsBuildToken | quote }}
+          {{ end }}
+          {{ if .Values.config.github.repositoryProvisioning.enabled }}
+            - name: DEPLOYFORGE_GITHUB_REPOSITORY_OWNER
+              value: {{ .Values.config.github.repositoryProvisioning.owner | quote }}
+            - name: DEPLOYFORGE_GITHUB_REPOSITORY_TEMPLATES
+              value: {{ .Values.config.github.repositoryProvisioning.templates | quote }}
+            - name: DEPLOYFORGE_GITHUB_REPOSITORY_PRIVATE
+              value: {{ .Values.config.github.repositoryProvisioning.private | quote }}
+            - name: DEPLOYFORGE_GITHUB_REPOSITORY_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.existingSecret | quote }}
+                  key: {{ .Values.secrets.keys.githubRepositoryToken | quote }}
+          {{ end }}
+          {{ if .Values.config.argocd.enabled }}
             - name: DEPLOYFORGE_ARGOCD_API_URL
               value: {{ .Values.config.argocd.apiUrl | quote }}
+            - name: DEPLOYFORGE_ARGOCD_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.existingSecret | quote }}
+                  key: {{ .Values.secrets.keys.argocdAuthToken | quote }}
             - name: DEPLOYFORGE_ARGOCD_API_TIMEOUT_SECONDS
               value: {{ .Values.config.argocd.apiTimeoutSeconds | quote }}
             - name: DEPLOYFORGE_GITOPS_SYNC_TIMEOUT_SECONDS
               value: {{ .Values.config.argocd.syncTimeoutSeconds | quote }}
             - name: DEPLOYFORGE_GITOPS_RECONCILE_INTERVAL_SECONDS
               value: {{ .Values.config.argocd.reconcileIntervalSeconds | quote }}
-            - name: DEPLOYFORGE_ARGOCD_AUTH_TOKEN
+          {{ end }}
+          {{ if .Values.config.flux.enabled }}
+            - name: DEPLOYFORGE_FLUX_API_URL
+              value: {{ .Values.config.flux.apiUrl | quote }}
+            - name: DEPLOYFORGE_FLUX_CLUSTER_NAME
+              value: {{ .Values.config.flux.clusterName | quote }}
+            - name: DEPLOYFORGE_FLUX_API_TIMEOUT_SECONDS
+              value: {{ .Values.config.flux.apiTimeoutSeconds | quote }}
+            - name: DEPLOYFORGE_FLUX_AUTH_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.secrets.existingSecret | quote }}
-                  key: {{ .Values.secrets.keys.argocdAuthToken | quote }}
-          {{- end }}
-          {{- with .Values.config.telemetry }}
-            - name: OTEL_EXPORTER_OTLP_ENDPOINT
-              value: {{ .otlpEndpoint | quote }}
-            - name: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
-              value: {{ .otlpTracesEndpoint | quote }}
-            - name: OTEL_EXPORTER_OTLP_METRICS_ENDPOINT
-              value: {{ .otlpMetricsEndpoint | quote }}
-            - name: OTEL_EXPORTER_OTLP_HEADERS
-              value: {{ .otlpHeaders | quote }}
-          {{- end }}
-          {{- with .Values.resources.worker }}
+                  key: {{ .Values.secrets.keys.fluxAuthToken | quote }}
+          {{ end }}
+          {{ if .Values.config.pagerduty.enabled }}
+            - name: DEPLOYFORGE_PAGERDUTY_ROUTING_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.existingSecret | quote }}
+                  key: {{ .Values.secrets.keys.pagerDutyRoutingKey | quote }}
+          {{ end }}
+          {{ if .Values.config.argoRollouts.enabled }}
+            - name: DEPLOYFORGE_ARGO_ROLLOUTS_API_URL
+              value: {{ .Values.config.argoRollouts.apiUrl | quote }}
+            - name: DEPLOYFORGE_ARGO_ROLLOUTS_API_TIMEOUT_SECONDS
+              value: {{ .Values.config.argoRollouts.apiTimeoutSeconds | quote }}
+            - name: DEPLOYFORGE_ARGO_ROLLOUTS_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.existingSecret | quote }}
+                  key: {{ .Values.secrets.keys.argoRolloutsAuthToken | quote }}
+          {{ end }}
+          {{- include "deployforge.containerSecurityContext" . | nindent 10 }}
           resources:
-            {{- toYaml . | nindent 12 }}
-          {{- end }}
-          {{- if .Values.database.tls.enabled }}
+            {{- toYaml .Values.resources.worker | nindent 12 }}
           volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.database.tls.enabled }}
             {{- include "deployforge.databaseVolumeMounts" . | nindent 12 }}
-          {{- end }}
-      {{- if .Values.database.tls.enabled }}
+            {{- end }}
       volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 128Mi
+        {{- if .Values.database.tls.enabled }}
         {{- include "deployforge.databaseVolumes" . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.nodeSelector }}
+        {{- end }}
       nodeSelector:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.affinity }}
-      affinity:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.tolerations }}
+        {{- toYaml .Values.nodeSelector | nindent 8 }}
       tolerations:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
+        {{- toYaml .Values.tolerations | nindent 8 }}
+      affinity:
+        {{- toYaml .Values.affinity | nindent 8 }}

@@ -1,0 +1,65 @@
+# CI-only values for rendering optional chart paths. These are fake values, not production settings.
+backup:
+  enabled: true
+  bucket: deployforge-backup-check
+  ageRecipient: age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq
+  serviceAccount:
+    annotations:
+      eks.amazonaws.com/role-arn: arn:aws:iam::111122223333:role/deployforge-backup
+
+auditExport:
+  enabled: true
+  bucket: deployforge-audit-check
+  serviceAccount:
+    annotations:
+      eks.amazonaws.com/role-arn: arn:aws:iam::111122223333:role/deployforge-audit
+
+apkParser:
+  enabled: true
+
+runtimeSecretMounts:
+  - secret:
+      name: deployforge-trusted-root
+      items:
+        - key: trusted_root.json
+          path: sigstore/trusted_root.json
+
+config:
+  scim:
+    enabled: true
+  github:
+    enabled: true
+    repositoryProvisioning:
+      enabled: true
+      owner: acme-platform
+      templates: '{"api-service":"acme-platform/api-template"}'
+  argocd:
+    enabled: true
+    apiUrl: https://argocd.example.com
+  flux:
+    enabled: true
+    apiUrl: https://kubernetes.example.com
+    clusterName: production
+  argoRollouts:
+    enabled: true
+    apiUrl: https://rollouts.example.com
+  pagerduty:
+    enabled: true
+  supplyChain:
+    trustedRootFile: /run/secrets/sigstore/trusted_root.json
+    trustedRootSha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+
+monitoring:
+  serviceMonitor:
+    enabled: true
+  prometheusRule:
+    enabled: true
+
+networkPolicy:
+  enabled: true
+  egress:
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: TCP
+          port: 443

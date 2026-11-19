@@ -42,6 +42,29 @@ intentionally contains a zero-digest placeholder and is not a real release.
 The GitHub callback and provider credentials must be configured before
 starting a DeployForge release.
 
+## Independent approval gates
+
+GitHub pull-request review and DeployForge release approval are separate
+controls:
+
+- The repository `main` branch requires one approving GitHub review, in
+  addition to its required CI checks. A reviewer must have repository write
+  access and cannot approve their own pull request.
+- A release waiting in DeployForge must be approved by a different signed-in
+  workspace member with the `workspace_admin` or `platform_engineer` role. The
+  release requester cannot approve it. When this staging Compose override is
+  active, the approver must also use a verified OIDC identity; the local
+  unverified development identities are rejected for approval decisions.
+
+If this is a single-person workspace, invite a real independent engineer to the
+GitHub repository, have them sign in to DeployForge, then add them under
+**Settings → Workspace Members** with the appropriate role. Do not lower the
+review requirement or use a second account controlled by the release requester
+to make the gate appear satisfied. A release remains safely paused until both
+the verified human approval and provider prerequisites are available. Configure
+an OIDC provider for the local staging API before expecting a second user to
+approve; local development email entry does not verify who is signing in.
+
 ## Optional temporary GitHub callback path
 
 The callback gateway is an opt-in local development profile. Its listener is

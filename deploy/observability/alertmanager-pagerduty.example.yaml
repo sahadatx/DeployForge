@@ -1,0 +1,17 @@
+route:
+  receiver: deployforge-oncall
+  group_by: [alertname, service, severity]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    - receiver: deployforge-oncall
+      matchers:
+        - service="deployforge"
+
+receivers:
+  - name: deployforge-oncall
+    pagerduty_configs:
+      - routing_key_file: /etc/alertmanager/secrets/pagerduty/routing-key
+        send_resolved: true
+        severity: '{{ .CommonLabels.severity }}'

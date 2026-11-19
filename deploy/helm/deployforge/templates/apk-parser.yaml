@@ -1,0 +1,115 @@
+{{- if .Values.apkParser.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "deployforge.fullname" . }}-apk-parser
+  labels:
+    {{- include "deployforge.labels" . | nindent 4 }}
+    app.kubernetes.io/component: apk-parser
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "deployforge.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: apk-parser
+  template:
+    metadata:
+      labels:
+        {{- include "deployforge.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: apk-parser
+    spec:
+      serviceAccountName: {{ include "deployforge.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      {{- include "deployforge.imagePullSecrets" . | nindent 6 }}
+      {{- include "deployforge.podSecurityContext" . | nindent 6 }}
+      containers:
+        - name: apk-parser
+          image: "{{- if .Values.images.apkParser.digest }}{{ .Values.images.apkParser.repository }}@{{ .Values.images.apkParser.digest }}{{- else }}{{ .Values.images.apkParser.repository }}:{{ .Values.images.apkParser.tag }}{{- end }}"
+          imagePullPolicy: {{ .Values.images.apkParser.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8100
+              protocol: TCP
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10002
+            runAsGroup: 10002
+            capabilities:
+              drop: [ALL]
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            {{- toYaml .Values.apkParser.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            failureThreshold: 30
+            periodSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 3
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 160Mi
+{{- end }}
+---
+{{- if .Values.apkParser.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "deployforge.fullname" . }}-apk-parser
+  labels:
+    {{- include "deployforge.labels" . | nindent 4 }}
+    app.kubernetes.io/component: apk-parser
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "deployforge.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: apk-parser
+  ports:
+    - name: http
+      port: 8100
+      targetPort: http
+      protocol: TCP
+{{- end }}
+---
+{{- if .Values.apkParser.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "deployforge.fullname" . }}-apk-parser-ingress
+  labels:
+    {{- include "deployforge.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "deployforge.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: apk-parser
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "deployforge.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: api
+      ports:
+        - protocol: TCP
+          port: 8100
+{{- end }}

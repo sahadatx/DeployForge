@@ -38,19 +38,36 @@ services:
       DEPLOYFORGE_OIDC_CLIENT_SECRET: ""
       DEPLOYFORGE_OIDC_CLIENT_SECRET_FILE: /run/secrets/oidc_client_secret
       DEPLOYFORGE_GITHUB_ACTIONS_TOKEN: ""
+      DEPLOYFORGE_GITHUB_REPOSITORY_TOKEN: ""
+      DEPLOYFORGE_GITLAB_BUILD_TOKEN: ""
+      DEPLOYFORGE_AZURE_DEVOPS_BUILD_TOKEN: ""
       DEPLOYFORGE_BUILD_CALLBACK_SECRET: ""
       DEPLOYFORGE_BUILD_CALLBACK_SECRET_FILE: /run/secrets/build_callback_secret
-      DEPLOYFORGE_BUILD_CALLBACK_PUBLIC_URL: ""
+      DEPLOYFORGE_BUILD_CALLBACK_PUBLIC_URL: ${DEPLOYFORGE_BUILD_CALLBACK_PUBLIC_URL:-}
+      DEPLOYFORGE_AZURE_DEVOPS_ORGANIZATION_URL: ${DEPLOYFORGE_AZURE_DEVOPS_ORGANIZATION_URL:-}
+      DEPLOYFORGE_AZURE_DEVOPS_OIDC_ISSUER: ${DEPLOYFORGE_AZURE_DEVOPS_OIDC_ISSUER:-}
+      DEPLOYFORGE_AZURE_DEVOPS_PIPELINE_IDS: ${DEPLOYFORGE_AZURE_DEVOPS_PIPELINE_IDS:-}
+      DEPLOYFORGE_SIGSTORE_TRUSTED_ROOT_FILE: ${DEPLOYFORGE_SIGSTORE_TRUSTED_ROOT_FILE:-}
+      DEPLOYFORGE_SIGSTORE_TRUSTED_ROOT_SHA256: ${DEPLOYFORGE_SIGSTORE_TRUSTED_ROOT_SHA256:-}
       DEPLOYFORGE_ARGOCD_AUTH_TOKEN: ""
-      DEPLOYFORGE_ARGOCD_API_URL: ""
+      DEPLOYFORGE_ARGOCD_API_URL: ${DEPLOYFORGE_ARGOCD_API_URL:-}
+      DEPLOYFORGE_FLUX_AUTH_TOKEN: ""
+      DEPLOYFORGE_FLUX_API_URL: ${DEPLOYFORGE_FLUX_API_URL:-}
+      DEPLOYFORGE_FLUX_CLUSTER_NAME: ${DEPLOYFORGE_FLUX_CLUSTER_NAME:-}
+      DEPLOYFORGE_FLUX_API_TIMEOUT_SECONDS: ${DEPLOYFORGE_FLUX_API_TIMEOUT_SECONDS:-15}
+      DEPLOYFORGE_ARGO_ROLLOUTS_API_URL: ${DEPLOYFORGE_ARGO_ROLLOUTS_API_URL:-}
       DEPLOYFORGE_REQUIRE_VERIFIED_SUPPLY_CHAIN: "true"
+      DEPLOYFORGE_APK_PARSER_URL: ${DEPLOYFORGE_APK_PARSER_URL:-}
+      DEPLOYFORGE_APK_PARSER_TIMEOUT_SECONDS: ${DEPLOYFORGE_APK_PARSER_TIMEOUT_SECONDS:-120}
       DEPLOYFORGE_DEV_AUTH_ENABLED: "false"
       DEPLOYFORGE_DEV_AUTH_AUTO_ADMIN_FIRST_USER: "false"
+      DEPLOYFORGE_REQUIRE_VERIFIED_APPROVAL_IDENTITY: "true"
     secrets:
       - database_url
       - session_secret
       - oidc_client_secret
       - build_callback_secret
+      - sigstore_trusted_root
     depends_on:
       postgres:
         condition: service_healthy
@@ -62,7 +79,7 @@ services:
       - database-internal
     read_only: true
     tmpfs:
-      - /tmp:size=64m,noexec,nosuid,nodev
+      - /tmp:size=256m,noexec,nosuid,nodev
       - /home/appuser/.cache:size=64m,noexec,nosuid,nodev
     cap_drop:
       - ALL
@@ -85,16 +102,42 @@ services:
       DEPLOYFORGE_OIDC_ADMIN_EMAILS: ""
       DEPLOYFORGE_GITHUB_ACTIONS_TOKEN: ""
       DEPLOYFORGE_GITHUB_ACTIONS_TOKEN_FILE: /run/secrets/github_actions_token
+      DEPLOYFORGE_GITLAB_BUILD_TOKEN: ""
+      DEPLOYFORGE_GITLAB_BUILD_TOKEN_FILE: /run/secrets/gitlab_build_token
+      DEPLOYFORGE_AZURE_DEVOPS_BUILD_TOKEN: ""
+      DEPLOYFORGE_AZURE_DEVOPS_BUILD_TOKEN_FILE: /run/secrets/azure_devops_build_token
+      DEPLOYFORGE_AZURE_DEVOPS_ORGANIZATION_URL: ${DEPLOYFORGE_AZURE_DEVOPS_ORGANIZATION_URL:-}
+      DEPLOYFORGE_AZURE_DEVOPS_OIDC_ISSUER: ${DEPLOYFORGE_AZURE_DEVOPS_OIDC_ISSUER:-}
+      DEPLOYFORGE_AZURE_DEVOPS_PIPELINE_IDS: ${DEPLOYFORGE_AZURE_DEVOPS_PIPELINE_IDS:-}
+      DEPLOYFORGE_SIGSTORE_TRUSTED_ROOT_FILE: ${DEPLOYFORGE_SIGSTORE_TRUSTED_ROOT_FILE:-}
+      DEPLOYFORGE_SIGSTORE_TRUSTED_ROOT_SHA256: ${DEPLOYFORGE_SIGSTORE_TRUSTED_ROOT_SHA256:-}
+      DEPLOYFORGE_GITHUB_REPOSITORY_TOKEN: ""
+      DEPLOYFORGE_GITHUB_REPOSITORY_TOKEN_FILE: /run/secrets/github_repository_token
       DEPLOYFORGE_BUILD_CALLBACK_SECRET: ""
+      DEPLOYFORGE_BUILD_CALLBACK_SECRET_FILE: /run/secrets/build_callback_secret
+      DEPLOYFORGE_BUILD_CALLBACK_PUBLIC_URL: ${DEPLOYFORGE_BUILD_CALLBACK_PUBLIC_URL:-}
       DEPLOYFORGE_ARGOCD_AUTH_TOKEN: ""
       DEPLOYFORGE_ARGOCD_AUTH_TOKEN_FILE: /run/secrets/argocd_auth_token
+      DEPLOYFORGE_FLUX_AUTH_TOKEN: ""
+      DEPLOYFORGE_FLUX_AUTH_TOKEN_FILE: /run/secrets/flux_auth_token
+      DEPLOYFORGE_FLUX_API_URL: ${DEPLOYFORGE_FLUX_API_URL:-}
+      DEPLOYFORGE_FLUX_CLUSTER_NAME: ${DEPLOYFORGE_FLUX_CLUSTER_NAME:-}
+      DEPLOYFORGE_FLUX_API_TIMEOUT_SECONDS: ${DEPLOYFORGE_FLUX_API_TIMEOUT_SECONDS:-15}
+      DEPLOYFORGE_ARGO_ROLLOUTS_AUTH_TOKEN: ""
+      DEPLOYFORGE_ARGO_ROLLOUTS_AUTH_TOKEN_FILE: /run/secrets/argo_rollouts_auth_token
       DEPLOYFORGE_SESSION_COOKIE_SECURE: "true"
       DEPLOYFORGE_DEV_AUTH_ENABLED: "false"
       DEPLOYFORGE_DEV_AUTH_AUTO_ADMIN_FIRST_USER: "false"
     secrets:
       - database_url
       - github_actions_token
+      - gitlab_build_token
+      - azure_devops_build_token
+      - github_repository_token
+      - build_callback_secret
       - argocd_auth_token
+      - flux_auth_token
+      - argo_rollouts_auth_token
     depends_on:
       postgres:
         condition: service_healthy
@@ -120,6 +163,7 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile.production
+    volumes: !reset []
     environment: !override {}
     ports: !override
       - "127.0.0.1:8080:8080"
@@ -152,10 +196,22 @@ secrets:
     file: ./secrets/oidc_client_secret
   build_callback_secret:
     file: ./secrets/build_callback_secret
+  sigstore_trusted_root:
+    file: ./secrets/sigstore_trusted_root.json
   github_actions_token:
     file: ./secrets/github_actions_token
+  gitlab_build_token:
+    file: ./secrets/gitlab_build_token
+  azure_devops_build_token:
+    file: ./secrets/azure_devops_build_token
+  github_repository_token:
+    file: ./secrets/github_repository_token
   argocd_auth_token:
     file: ./secrets/argocd_auth_token
+  flux_auth_token:
+    file: ./secrets/flux_auth_token
+  argo_rollouts_auth_token:
+    file: ./secrets/argo_rollouts_auth_token
 
 networks:
   database-internal:

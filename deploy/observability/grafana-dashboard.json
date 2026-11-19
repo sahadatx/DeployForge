@@ -1,0 +1,62 @@
+{
+  "id": null,
+  "uid": "deployforge-control-plane",
+  "title": "DeployForge Control Plane",
+  "tags": ["deployforge", "platform"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": {"from": "now-6h", "to": "now"},
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "API requests per second",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "targets": [{"expr": "sum by (status) (rate(deployforge_http_requests_total[5m]))", "legendFormat": "{{status}}", "refId": "A"}]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "API p95 latency",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "targets": [{"expr": "histogram_quantile(0.95, sum by (le) (rate(deployforge_http_request_duration_seconds_bucket[5m])))", "legendFormat": "p95", "refId": "A"}]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Active workers",
+      "gridPos": {"h": 5, "w": 6, "x": 0, "y": 8},
+      "targets": [{"expr": "deployforge_active_workers", "legendFormat": "workers", "refId": "A"}]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Active SLO alerts",
+      "gridPos": {"h": 5, "w": 6, "x": 6, "y": 8},
+      "targets": [{"expr": "deployforge_active_slo_alerts", "legendFormat": "alerts", "refId": "A"}]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Waiting jobs by kind",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "targets": [{"expr": "sum by (kind) (deployforge_job_queue_depth{status=~\"queued|apply_queued\"})", "legendFormat": "{{kind}}", "refId": "A"}]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Oldest waiting job age",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 13},
+      "targets": [{"expr": "deployforge_job_queue_oldest_age_seconds", "legendFormat": "{{kind}}", "refId": "A"}]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Database connections checked out",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
+      "targets": [{"expr": "deployforge_db_pool_checked_out", "legendFormat": "checked out", "refId": "A"}]
+    }
+  ]
+}
