@@ -52,6 +52,30 @@ def test_production_rejects_insecure_browser_and_identity_urls():
         production_settings(oidc_redirect_uri="http://deployforge.example.com/callback")
 
 
+def test_repository_bootstrap_token_is_optional_when_blank_and_worker_scoped_in_production():
+    assert Settings(_env_file=None, github_repository_token="").github_repository_token is None
+
+    worker_base = {
+        "runtime_role": "worker",
+        "session_secret": None,
+        "session_cookie_secure": False,
+        "oidc_discovery_url": "",
+        "oidc_client_id": "",
+        "oidc_client_secret": None,
+        "oidc_redirect_uri": "",
+        "build_callback_secret": "b" * 48,
+        "build_callback_public_url": "https://deployforge.example.com",
+        "require_verified_supply_chain": False,
+        "github_repository_owner": "acme-platform",
+        "github_repository_templates": '{"api-service":"acme-platform/api-template"}',
+    }
+    with pytest.raises(ValidationError, match="configured together on the worker"):
+        production_settings(**worker_base)
+
+    worker = production_settings(**worker_base, github_repository_token="repository-token-12345")
+    assert worker.github_repository_provisioning_configured
+
+
 def test_development_auth_is_rejected_outside_local_environments():
     with pytest.raises(ValidationError, match="only be enabled locally"):
         Settings(

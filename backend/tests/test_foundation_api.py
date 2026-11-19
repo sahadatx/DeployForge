@@ -1,5 +1,7 @@
 from fastapi.testclient import TestClient
 
+from tests.auth_helpers import sign_in
+
 
 def test_liveness_endpoint(client: TestClient):
     response = client.get("/api/v1/health/live")
@@ -16,11 +18,7 @@ def test_ready_endpoint_checks_database(client: TestClient):
 
 
 def test_system_status_reports_starting_worker_without_heartbeat(client: TestClient):
-    login = client.post(
-        "/api/v1/auth/dev-login",
-        json={"email": "platform-operator@example.dev", "display_name": "Platform Operator"},
-    )
-    assert login.status_code == 200
+    sign_in(client, "platform-operator@example.dev", "Platform Operator")
     response = client.get("/api/v1/system/status")
 
     assert response.status_code == 200

@@ -8,15 +8,7 @@ from pydantic import SecretStr
 
 from app.core.config import settings
 from app.core.infrastructure import process_next_infrastructure_run
-
-
-def sign_in(client: TestClient, email: str, name: str) -> dict:
-    response = client.post(
-        "/api/v1/auth/dev-login",
-        json={"email": email, "display_name": name},
-    )
-    assert response.status_code == 200, response.text
-    return response.json()
+from tests.auth_helpers import sign_in
 
 
 def prepare_provider(monkeypatch) -> str:

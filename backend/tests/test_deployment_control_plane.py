@@ -4,17 +4,10 @@ from uuid import UUID
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
+from app.core.config import settings
 from app.core.deployments import process_next_deployment, recover_expired_leases
-from app.models import Deployment, DeploymentEvent
-
-
-def sign_in(client: TestClient, email: str, display_name: str) -> dict:
-    response = client.post(
-        "/api/v1/auth/dev-login",
-        json={"email": email, "display_name": display_name},
-    )
-    assert response.status_code == 200, response.text
-    return response.json()
+from app.models import AuditEvent, Deployment, DeploymentEvent
+from tests.auth_helpers import sign_in
 
 
 def create_deployment_prerequisites(
@@ -295,3 +288,53 @@ def test_expired_worker_lease_recovers_or_exhausts_attempts(client):
             ).all()
         )
         assert event_types[-2:] == ["lease.recovered", "lease.exhausted"]
+
+
+def test_verified_approval_identity_blocks_development_approver_and_audits_denial(
+    client, monkeypatch
+):
+    monkeypatch.setattr(settings, "require_verified_approval_identity", True)
+    requester = sign_in(client, "verified-requester@example.dev", "Release Requester")
+    workspace, service, environment = create_deployment_prerequisites(client, requester)
+    accepted, deployment = queue_deployment(
+        client,
+        requester,
+        workspace["id"],
+        service["id"],
+        environment["id"],
+        key="verified-approval-release-1",
+    )
+    assert accepted.status_code == 202, accepted.text
+    with client.app.state.test_session_factory() as db:
+        assert process_next_deployment(db, "deployment-worker-verified-test") is True
+
+    approver_client = TestClient(client.app)
+    approver = sign_in(approver_client, "unverified-approver@example.dev", "Local Approver")
+    membership = client.post(
+        f"/api/v1/workspaces/{workspace['id']}/members",
+        json={"email": approver["user"]["email"], "role": "platform_engineer"},
+        headers={"X-CSRF-Token": requester["csrf_token"]},
+    )
+    assert membership.status_code == 201, membership.text
+
+    denied = approver_client.post(
+        f"/api/v1/workspaces/{workspace['id']}/deployments/{deployment['id']}/approval",
+        json={"decision": "approve"},
+        headers={"X-CSRF-Token": approver["csrf_token"]},
+    )
+    assert denied.status_code == 403
+    assert "verified organization sign-in" in denied.json()["error"]["message"]
+
+    current = client.get(
+        f"/api/v1/workspaces/{workspace['id']}/deployments/{deployment['id']}"
+    )
+    assert current.status_code == 200
+    assert current.json()["status"] == "awaiting_approval"
+    with client.app.state.test_session_factory() as db:
+        denial = db.scalar(
+            select(AuditEvent).where(
+                AuditEvent.action == "authorization.approval_identity.denied"
+            )
+        )
+        assert denial is not None
+        assert denial.outcome == "denied"

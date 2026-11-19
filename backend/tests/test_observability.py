@@ -1,15 +1,14 @@
 from datetime import UTC, datetime, timedelta
+from uuid import UUID
 
 from fastapi.testclient import TestClient
 
+from app.models import SloAlert
+from tests.auth_helpers import sign_in as sign_in_local
+
 
 def sign_in(client: TestClient) -> dict:
-    response = client.post(
-        "/api/v1/auth/dev-login",
-        json={"email": "observability@example.dev", "display_name": "SRE Engineer"},
-    )
-    assert response.status_code == 200, response.text
-    return response.json()
+    return sign_in_local(client, "observability@example.dev", "SRE Engineer")
 
 
 def setup_workspace(client: TestClient) -> tuple[dict, dict, dict, dict]:
@@ -58,6 +57,51 @@ def setup_workspace(client: TestClient) -> tuple[dict, dict, dict, dict]:
     )
     assert source_response.status_code == 201, source_response.text
     return session, workspace, service, {**source_response.json(), "headers": headers}
+
+
+def test_alert_pagination_preserves_status_filter_and_timestamp_ties(client):
+    _session, workspace, service, source = setup_workspace(client)
+    base = f"/api/v1/workspaces/{workspace['id']}"
+    created = client.post(
+        f"{base}/slos",
+        json={
+            "slug": "paginated-alerts",
+            "name": "Paginated alerts",
+            "service_id": service["id"],
+            "indicator": "availability",
+            "objective": 0.99,
+            "window_hours": 24,
+        },
+        headers=source["headers"],
+    )
+    assert created.status_code == 201, created.text
+    slo_id = created.json()["id"]
+    evaluation = client.post(f"{base}/slos/{slo_id}/evaluate", headers=source["headers"])
+    assert evaluation.status_code == 201, evaluation.text
+    with client.app.state.test_session_factory() as db:
+        db.add_all(
+            SloAlert(
+                id=UUID(int=index),
+                workspace_id=UUID(workspace["id"]),
+                slo_id=UUID(slo_id),
+                evaluation_id=UUID(evaluation.json()["id"]),
+                status="resolved" if index < 6 else "firing",
+                summary=f"Alert {index}",
+                details={},
+                created_at=datetime(2099, 1, 1, tzinfo=UTC),
+            )
+            for index in range(1, 7)
+        )
+        db.commit()
+
+    for offset, expected in ((0, [5, 4]), (2, [3, 2]), (4, [1]), (5, [])):
+        response = client.get(f"{base}/alerts?status=resolved&limit=2&offset={offset}")
+        assert response.status_code == 200, response.text
+        assert [alert["id"] for alert in response.json()] == [
+            str(UUID(int=index)) for index in expected
+        ]
+        assert all(alert["status"] == "resolved" for alert in response.json())
+    assert client.get(f"{base}/alerts?offset=-1").status_code == 422
 
 
 def test_metric_source_is_scoped_hashed_revocable_and_idempotent(client):

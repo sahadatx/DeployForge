@@ -12,18 +12,163 @@ from pydantic import SecretStr
 from app.core.builds import process_next_build_run
 from app.core.config import settings
 from app.core.deployments import process_next_deployment
-from app.core.gitops import process_next_gitops_run
+from app.core.gitops import (
+    _oci_artifact_digest_is_observed,
+    process_next_gitops_rollout_action,
+    process_next_gitops_run,
+)
 from app.integrations.argocd import ArgoCDClient, ArgoCDConfiguration
-from app.models import GitOpsRun
+from app.models import Environment, GitOpsRun
+from tests.auth_helpers import sign_in
 
 
-def sign_in(client: TestClient, email: str, name: str) -> dict:
-    response = client.post(
-        "/api/v1/auth/dev-login",
-        json={"email": email, "display_name": name},
+def test_oci_artifact_observation_requires_repository_and_exact_digest():
+    digest = "sha256:" + "a" * 64
+    artifact_uri = f"oci://ghcr.io/acme/payments-api:build-tag@{digest}"
+
+    assert _oci_artifact_digest_is_observed(
+        artifact_uri,
+        digest,
+        [f"ghcr.io/acme/payments-api@{digest}"],
     )
-    assert response.status_code == 200, response.text
-    return response.json()
+    assert not _oci_artifact_digest_is_observed(
+        artifact_uri,
+        digest,
+        [f"ghcr.io/acme/payments-api@sha256:{'b' * 64}"],
+    )
+    assert not _oci_artifact_digest_is_observed(
+        artifact_uri,
+        digest,
+        [f"ghcr.io/acme/other-api@{digest}"],
+    )
+    assert not _oci_artifact_digest_is_observed(artifact_uri, digest, [])
+
+
+def test_rollout_stage_action_is_audited_and_promotes_only_one_step(client, monkeypatch):
+    callback_secret = prepare_build_provider(monkeypatch)
+    monkeypatch.setattr(settings, "argo_rollouts_api_url", "https://rollouts.example.test")
+    monkeypatch.setattr(
+        settings, "argo_rollouts_auth_token", SecretStr("rollouts-test-token-123456")
+    )
+    workspace = setup_workspace(client, suffix="rollout-control")
+
+    class FakeRollouts:
+        promotions: list[tuple[str, str]] = []
+        aborts: list[tuple[str, str]] = []
+
+        def __init__(self) -> None:
+            self.step_index = 1
+
+        def get_rollout_info(self, namespace: str, name: str) -> dict:
+            return {
+                "rollout": {
+                    "metadata": {"name": name, "namespace": namespace},
+                    "spec": {"strategy": {"canary": {"steps": [{"setWeight": 10}, {"pause": {}}]}}},
+                    "status": {
+                        "phase": "Paused",
+                        "currentStepIndex": self.step_index,
+                        "pauseConditions": [{"reason": "CanaryPauseStep"}],
+                    },
+                }
+            }
+
+        def promote_rollout(self, namespace: str, name: str) -> dict:
+            self.promotions.append((namespace, name))
+            return {"accepted": True}
+
+        def abort_rollout(self, namespace: str, name: str) -> dict:
+            self.aborts.append((namespace, name))
+            return {"accepted": True}
+
+    rollouts = FakeRollouts()
+    monkeypatch.setattr("app.core.gitops._argo_rollouts_client", lambda: rollouts)
+    monkeypatch.setattr("app.core.gitops._argo_client", lambda: FakeArgoCD())
+    deployment_id, _ = create_build_run(
+        client,
+        workspace,
+        callback_secret,
+        release_number=11,
+        commit_sha="a" * 40,
+        gitops_revision="b" * 40,
+    )
+    run_data = client.get(
+        f"/api/v1/workspaces/{workspace['id']}/gitops-runs?deployment_id={deployment_id}"
+    ).json()[0]
+    with client.app.state.test_session_factory() as db:
+        assert process_next_gitops_run(db, "gitops-worker-rollouts") is True
+        run = db.get(GitOpsRun, UUID(run_data["id"]))
+        assert run is not None and run.status == "syncing"
+        run.rollout_snapshot = {
+            "phase": "Progressing",
+            "paused": False,
+            "current_step_index": 1,
+            "step_count": 2,
+            "current_step": {"set_weight": None, "pause_duration": None, "pause_conditions": []},
+            "replicas": {"replicas": 0, "updated": 0, "ready": 0, "available": 0},
+            "analysis_runs": [],
+        }
+        environment = db.get(Environment, UUID(workspace["environment"]["id"]))
+        assert environment is not None
+        environment.namespace = "payments-staging"
+        db.commit()
+
+    blocked = client.post(
+        f"/api/v1/workspaces/{workspace['id']}/gitops-runs/{run_data['id']}/promote",
+        json={"comment": "Release approval"},
+        headers=workspace["headers"],
+    )
+    assert blocked.status_code == 409
+
+    with client.app.state.test_session_factory() as db:
+        run = db.get(GitOpsRun, UUID(run_data["id"]))
+        assert run is not None
+        run.rollout_snapshot = {
+            **run.rollout_snapshot,
+            "paused": True,
+            "phase": "Paused",
+        }
+        db.commit()
+
+    queued = client.post(
+        f"/api/v1/workspaces/{workspace['id']}/gitops-runs/{run_data['id']}/promote",
+        json={"comment": "Metrics are healthy"},
+        headers=workspace["headers"],
+    )
+    assert queued.status_code == 202, queued.text
+    assert queued.json()["status"] == "queued"
+    duplicate = client.post(
+        f"/api/v1/workspaces/{workspace['id']}/gitops-runs/{run_data['id']}/promote",
+        json={"comment": "Duplicate request"},
+        headers=workspace["headers"],
+    )
+    assert duplicate.status_code == 409
+    with client.app.state.test_session_factory() as db:
+        assert process_next_gitops_rollout_action(db, "gitops-worker-rollouts") is True
+
+    assert rollouts.promotions == [("payments-staging", workspace["target"]["application_name"])]
+    assert rollouts.aborts == []
+    detail = client.get(f"/api/v1/workspaces/{workspace['id']}/gitops-runs/{run_data['id']}")
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["rollout_actions"][0]["status"] == "succeeded"
+    assert any(
+        event["event_type"] == "rollout_action.succeeded" for event in detail.json()["events"]
+    )
+
+    rollouts.step_index = 2
+    stale = client.post(
+        f"/api/v1/workspaces/{workspace['id']}/gitops-runs/{run_data['id']}/promote",
+        json={"comment": "Stage changed"},
+        headers=workspace["headers"],
+    )
+    assert stale.status_code == 202, stale.text
+    with client.app.state.test_session_factory() as db:
+        assert process_next_gitops_rollout_action(db, "gitops-worker-rollouts") is True
+    detail = client.get(f"/api/v1/workspaces/{workspace['id']}/gitops-runs/{run_data['id']}").json()
+    assert [action["status"] for action in detail["rollout_actions"]] == [
+        "succeeded",
+        "superseded",
+    ]
+    assert len(rollouts.promotions) == 1
 
 
 def setup_workspace(client: TestClient, *, suffix: str = "one") -> dict:
@@ -224,8 +369,10 @@ class FakeArgoCD:
                 "sync": {"status": "Synced", "revision": "old-revision"},
                 "health": {"status": "Healthy"},
                 "operationState": {"phase": "Succeeded"},
+                "summary": {"images": []},
             },
         }
+        self.images: list[str] = []
 
     def get_application(self, application_name: str) -> dict:
         assert application_name.startswith("payments-api-staging-")
@@ -245,6 +392,7 @@ class FakeArgoCD:
                 "sync": {"status": "Synced", "revision": revision},
                 "health": {"status": "Healthy"},
                 "operationState": {"phase": "Succeeded"},
+                "summary": {"images": self.images},
             }
         return {"metadata": {"name": application_name}}
 
@@ -333,6 +481,186 @@ def test_healthy_gitops_reconciliation_completes_deployment_on_exact_revision(cl
         f"/api/v1/workspaces/{workspace['id']}/deployments/{deployment_id}"
     ).json()
     assert deployment["status"] == "succeeded"
+
+
+def test_promotion_reuses_healthy_artifact_and_preserves_release_gates(client, monkeypatch):
+    callback_secret = prepare_build_provider(monkeypatch)
+    workspace = setup_workspace(client, suffix="promotion")
+    argo = FakeArgoCD()
+    monkeypatch.setattr("app.core.gitops._argo_client", lambda: argo)
+    source_deployment_id, source_build_run_id = create_build_run(
+        client,
+        workspace,
+        callback_secret,
+        release_number=1,
+        commit_sha="a" * 40,
+        gitops_revision="c" * 40,
+    )
+    source_gitops_run = client.get(
+        f"/api/v1/workspaces/{workspace['id']}/gitops-runs?deployment_id={source_deployment_id}"
+    ).json()[0]
+    with client.app.state.test_session_factory() as db:
+        assert process_next_gitops_run(db, "gitops-worker-test") is True
+    set_run_due(client, source_gitops_run["id"])
+    with client.app.state.test_session_factory() as db:
+        assert process_next_gitops_run(db, "gitops-worker-test") is True
+    assert (
+        client.get(
+            f"/api/v1/workspaces/{workspace['id']}/deployments/{source_deployment_id}"
+        ).json()["status"]
+        == "succeeded"
+    )
+
+    environment_response = client.post(
+        f"/api/v1/workspaces/{workspace['id']}/environments",
+        json={"slug": "qa", "name": "QA", "environment_type": "staging"},
+        headers=workspace["headers"],
+    )
+    assert environment_response.status_code == 201, environment_response.text
+    target_environment = environment_response.json()
+    target_response = client.post(
+        f"/api/v1/workspaces/{workspace['id']}/gitops-targets",
+        json={
+            "service_id": workspace["service"]["id"],
+            "environment_id": target_environment["id"],
+            "application_name": "payments-api-qa-promotion",
+            "expected_project": "platform",
+            "expected_cluster_name": "qa-cluster",
+        },
+        headers=workspace["headers"],
+    )
+    assert target_response.status_code == 201, target_response.text
+    eligible = client.get(
+        f"/api/v1/workspaces/{workspace['id']}/promotion-artifacts",
+        params={
+            "service_id": workspace["service"]["id"],
+            "environment_id": target_environment["id"],
+        },
+    )
+    assert eligible.status_code == 200, eligible.text
+    assert len(eligible.json()) == 1
+    source_artifact = eligible.json()[0]
+    assert source_artifact["source_build_run_id"] == source_build_run_id
+
+    promotion = client.post(
+        f"/api/v1/workspaces/{workspace['id']}/deployments",
+        json={
+            "service_id": workspace["service"]["id"],
+            "environment_id": target_environment["id"],
+            "version": "release-1-promoted",
+            "artifact_id": source_artifact["id"],
+            "gitops_revision": "e" * 40,
+        },
+        headers=workspace["headers"],
+    )
+    assert promotion.status_code == 202, promotion.text
+    promotion_deployment_id = promotion.json()["id"]
+    with client.app.state.test_session_factory() as db:
+        assert process_next_deployment(db, "deployment-worker-test") is True
+    assert (
+        client.get(
+            f"/api/v1/workspaces/{workspace['id']}/deployments/{promotion_deployment_id}"
+        ).json()["status"]
+        == "awaiting_approval"
+    )
+
+    approver_client = TestClient(client.app)
+    approver = sign_in(approver_client, "promotion-approver@example.dev", "Promotion Approver")
+    membership = client.post(
+        f"/api/v1/workspaces/{workspace['id']}/members",
+        json={"email": approver["user"]["email"], "role": "platform_engineer"},
+        headers=workspace["headers"],
+    )
+    assert membership.status_code == 201, membership.text
+    approved = approver_client.post(
+        f"/api/v1/workspaces/{workspace['id']}/deployments/{promotion_deployment_id}/approval",
+        json={"decision": "approve"},
+        headers={"X-CSRF-Token": approver["csrf_token"]},
+    )
+    assert approved.status_code == 200, approved.text
+    assert approved.json()["status"] == "ready_to_deploy"
+    promoted_builds = approver_client.get(
+        f"/api/v1/workspaces/{workspace['id']}/build-runs?deployment_id={promotion_deployment_id}"
+    ).json()
+    assert len(promoted_builds) == 1
+    assert promoted_builds[0]["provider"] == "artifact_promotion"
+    promoted_build_detail = approver_client.get(
+        f"/api/v1/workspaces/{workspace['id']}/build-runs/{promoted_builds[0]['id']}"
+    )
+    assert promoted_build_detail.status_code == 200, promoted_build_detail.text
+    promoted_artifact = promoted_build_detail.json()["artifacts"][0]
+    assert promoted_artifact["digest"] == source_artifact["digest"]
+    gitops_runs = approver_client.get(
+        f"/api/v1/workspaces/{workspace['id']}/gitops-runs?deployment_id={promotion_deployment_id}"
+    ).json()
+    assert len(gitops_runs) == 1
+    assert gitops_runs[0]["desired_revision"] == "e" * 40
+    assert gitops_runs[0]["artifact_digest"] == source_artifact["digest"]
+
+
+def test_verified_gitops_requires_live_image_digest_and_rolls_back_mismatch(client, monkeypatch):
+    callback_secret = prepare_build_provider(monkeypatch)
+    workspace = setup_workspace(client, suffix="digest-binding")
+    argo = FakeArgoCD()
+    monkeypatch.setattr("app.core.gitops._argo_client", lambda: argo)
+    first_digest = f"sha256:{1:064x}"
+
+    argo.images = [f"ghcr.io/acme/payments-api@{first_digest}"]
+    first_deployment_id, _ = create_build_run(
+        client,
+        workspace,
+        callback_secret,
+        release_number=1,
+        commit_sha="a" * 40,
+        gitops_revision="c" * 40,
+    )
+    monkeypatch.setattr(settings, "require_verified_supply_chain", True)
+    first_run = client.get(
+        f"/api/v1/workspaces/{workspace['id']}/gitops-runs?deployment_id={first_deployment_id}"
+    ).json()[0]
+    with client.app.state.test_session_factory() as db:
+        assert process_next_gitops_run(db, "gitops-worker-test") is True
+    set_run_due(client, first_run["id"])
+    with client.app.state.test_session_factory() as db:
+        assert process_next_gitops_run(db, "gitops-worker-test") is True
+    assert (
+        client.get(f"/api/v1/workspaces/{workspace['id']}/gitops-runs/{first_run['id']}").json()[
+            "status"
+        ]
+        == "succeeded"
+    )
+
+    monkeypatch.setattr(settings, "require_verified_supply_chain", False)
+    argo.images = [f"ghcr.io/acme/payments-api@{first_digest}"]
+    second_deployment_id, _ = create_build_run(
+        client,
+        workspace,
+        callback_secret,
+        release_number=2,
+        commit_sha="b" * 40,
+        gitops_revision="d" * 40,
+    )
+    monkeypatch.setattr(settings, "require_verified_supply_chain", True)
+    second_run = client.get(
+        f"/api/v1/workspaces/{workspace['id']}/gitops-runs?deployment_id={second_deployment_id}"
+    ).json()[0]
+    with client.app.state.test_session_factory() as db:
+        assert process_next_gitops_run(db, "gitops-worker-test") is True
+    set_run_due(client, second_run["id"])
+    with client.app.state.test_session_factory() as db:
+        assert process_next_gitops_run(db, "gitops-worker-test") is True
+
+    failed_run = client.get(
+        f"/api/v1/workspaces/{workspace['id']}/gitops-runs/{second_run['id']}"
+    ).json()
+    assert failed_run["status"] == "failed"
+    assert failed_run["failure_code"] == "gitops_artifact_digest_mismatch"
+    rollback_runs = client.get(
+        f"/api/v1/workspaces/{workspace['id']}/gitops-runs?deployment_id={second_deployment_id}"
+    ).json()
+    assert any(
+        run["action_kind"] == "rollback" and run["status"] == "queued" for run in rollback_runs
+    )
 
 
 def test_failed_rollout_automatically_restores_previous_healthy_revision(client, monkeypatch):

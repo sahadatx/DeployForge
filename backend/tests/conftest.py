@@ -7,6 +7,7 @@ from sqlalchemy.pool import StaticPool
 from app import models  # noqa: F401
 from app.catalog_seed import seed_builtin_golden_paths
 from app.core.config import settings
+from app.core.local_passwords import local_login_limiter
 from app.db.base import Base
 from app.db.session import get_db
 from app.main import app
@@ -14,6 +15,7 @@ from app.main import app
 
 @pytest.fixture
 def client(monkeypatch):
+    local_login_limiter.clear()
     engine = create_engine(
         "sqlite://",
         connect_args={"check_same_thread": False},

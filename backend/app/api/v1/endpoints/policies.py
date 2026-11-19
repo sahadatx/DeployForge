@@ -8,7 +8,10 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_identity, get_db, require_csrf
 from app.core.audit import record_audit
-from app.core.authorization import require_workspace_access
+from app.core.authorization import (
+    require_verified_approval_identity,
+    require_workspace_access,
+)
 from app.core.policies import POLICY_ADMIN_ROLES, evaluate_policy_set
 from app.models import (
     Environment,
@@ -471,6 +474,13 @@ def decide_policy_exception(
         raise HTTPException(
             status_code=403, detail="The requester cannot review their own exception"
         )
+    require_verified_approval_identity(
+        db,
+        actor,
+        workspace_id=workspace_id,
+        resource_type="policy_exception",
+        resource_id=exception.id,
+    )
     now = datetime.now(UTC)
     policy = _load_policy(db, workspace_id, exception.policy_id)
     if not policy.enabled or policy.version != exception.policy_version:

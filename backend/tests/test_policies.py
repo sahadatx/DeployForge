@@ -2,11 +2,7 @@ from datetime import UTC, datetime, timedelta
 
 from fastapi.testclient import TestClient
 
-
-def sign_in(client: TestClient, email: str, name: str) -> dict:
-    response = client.post("/api/v1/auth/dev-login", json={"email": email, "display_name": name})
-    assert response.status_code == 200, response.text
-    return response.json()
+from tests.auth_helpers import sign_in
 
 
 def create_workspace(client: TestClient, owner: dict, slug: str) -> dict:

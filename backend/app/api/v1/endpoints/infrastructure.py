@@ -8,7 +8,10 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.api.deps import get_current_identity, get_db, require_csrf
 from app.core.audit import record_audit
-from app.core.authorization import require_workspace_access
+from app.core.authorization import (
+    require_verified_approval_identity,
+    require_workspace_access,
+)
 from app.core.builds import verify_callback_signature
 from app.core.config import settings
 from app.core.infrastructure import (
@@ -318,6 +321,13 @@ def approve_infrastructure_run(
         raise HTTPException(
             status_code=403, detail="The plan requester cannot approve their own plan"
         )
+    require_verified_approval_identity(
+        db,
+        actor,
+        workspace_id=workspace_id,
+        resource_type="infrastructure_run",
+        resource_id=run.id,
+    )
     environment = db.get(Environment, run.environment_id)
     if environment is None:
         raise HTTPException(status_code=409, detail="Infrastructure environment no longer exists")
@@ -384,6 +394,13 @@ def reject_infrastructure_run(
         raise HTTPException(
             status_code=403, detail="The plan requester cannot reject their own plan"
         )
+    require_verified_approval_identity(
+        db,
+        actor,
+        workspace_id=workspace_id,
+        resource_type="infrastructure_run",
+        resource_id=run.id,
+    )
     try:
         transition_infrastructure_run(
             db,
@@ -420,7 +437,7 @@ def retry_infrastructure_run(
         raise HTTPException(
             status_code=409, detail="Only blocked infrastructure runs can be retried"
         )
-    if not settings.infrastructure_runs_configured:
+    if not settings.infrastructure_runs_available:
         raise HTTPException(
             status_code=409, detail="Infrastructure workflow integration is not configured"
         )

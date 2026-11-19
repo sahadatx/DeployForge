@@ -16,6 +16,7 @@ router = APIRouter()
 def list_audit_events(
     workspace_id: UUID | None = None,
     limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     identity: tuple[User, UserSession] = Depends(get_current_identity),
     db: Session = Depends(get_db),
 ) -> list[AuditEvent]:
@@ -32,4 +33,10 @@ def list_audit_events(
             )
         require_workspace_access(db, user, workspace_id)
         query = query.where(AuditEvent.workspace_id == workspace_id)
-    return list(db.scalars(query.order_by(AuditEvent.created_at.desc()).limit(limit)).all())
+    return list(
+        db.scalars(
+            query.order_by(AuditEvent.created_at.desc(), AuditEvent.id.desc())
+            .limit(limit)
+            .offset(offset)
+        ).all()
+    )

@@ -3,6 +3,7 @@ import hmac
 import json
 import time
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import httpx
@@ -10,9 +11,16 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import SecretStr, ValidationError
 
+from app.api.v1.endpoints.build_runs import MAX_CALLBACK_BYTES
+from app.core import supply_chain
 from app.core.builds import _recover_build_runs, process_next_build_run
 from app.core.config import Settings, settings
 from app.core.deployments import process_next_deployment
+from app.core.supply_chain import (
+    SupplyChainVerificationUnavailable,
+    _expected_workflow_identity,
+    _production_verifier,
+)
 from app.integrations.github_actions import (
     DispatchConfiguration,
     GitHubDispatchError,
@@ -20,15 +28,7 @@ from app.integrations.github_actions import (
     parse_github_repository,
 )
 from app.models import BuildRun
-
-
-def sign_in(client: TestClient, email: str, name: str) -> dict:
-    response = client.post(
-        "/api/v1/auth/dev-login",
-        json={"email": email, "display_name": name},
-    )
-    assert response.status_code == 200, response.text
-    return response.json()
+from tests.auth_helpers import sign_in
 
 
 def create_approved_release(
@@ -223,6 +223,65 @@ def test_github_repository_parser_and_workflow_dispatch_are_scoped(client):
     assert body["inputs"]["callback_url"].endswith(f"/build-runs/{build_run.id}/callback")
 
 
+def test_private_github_server_and_sigstore_issuer_are_scoped(monkeypatch):
+    server_url = "https://github.enterprise.example"
+    issuer = f"{server_url}/_services/token"
+    monkeypatch.setattr(settings, "github_server_url", server_url)
+    monkeypatch.setattr(settings, "sigstore_oidc_issuer", issuer)
+    build_run = SimpleNamespace(
+        provider="github_actions",
+        repository_url=f"{server_url}/acme/payments-api",
+        source_ref="refs/heads/main",
+        workflow_path=".github/workflows/deployforge-build.yml",
+        commit_sha="a" * 40,
+    )
+    identity = (
+        f"{server_url}/acme/payments-api/.github/workflows/deployforge-build.yml@refs/heads/main"
+    )
+    evidence = SimpleNamespace(signer_identity=identity, oidc_issuer=issuer)
+
+    assert parse_github_repository(build_run.repository_url) == ("acme", "payments-api")
+    assert _expected_workflow_identity(build_run, evidence) == identity
+    with pytest.raises(GitHubDispatchError):
+        parse_github_repository("https://attacker.example/acme/payments-api")
+    with pytest.raises(ValidationError):
+        Settings(
+            _env_file=None,
+            sigstore_trusted_root_file="/run/secrets/trusted-root.json",
+        )
+
+
+def test_custom_sigstore_trust_root_is_checksum_pinned(tmp_path, monkeypatch):
+    root_file = tmp_path / "private-trusted-root.json"
+    root_bytes = b'{"mediaType":"application/vnd.dev.sigstore.trustedroot+json;version=0.1"}'
+    root_file.write_bytes(root_bytes)
+    expected_hash = hashlib.sha256(root_bytes).hexdigest()
+    loaded_root = object()
+    monkeypatch.setattr(settings, "sigstore_trusted_root_file", str(root_file))
+    monkeypatch.setattr(settings, "sigstore_trusted_root_sha256", expected_hash)
+    monkeypatch.setattr(
+        supply_chain.TrustedRoot,
+        "from_file",
+        classmethod(lambda cls, path: loaded_root),
+    )
+
+    class FakeVerifier:
+        def __init__(self, *, trusted_root):
+            self.trusted_root = trusted_root
+
+    monkeypatch.setattr(supply_chain, "Verifier", FakeVerifier)
+    supply_chain._verifier_for_custom_trust_root.cache_clear()
+    try:
+        verifier = _production_verifier()
+        assert verifier.trusted_root is loaded_root
+
+        monkeypatch.setattr(settings, "sigstore_trusted_root_sha256", "0" * 64)
+        with pytest.raises(SupplyChainVerificationUnavailable, match="checksum"):
+            _production_verifier()
+    finally:
+        supply_chain._verifier_for_custom_trust_root.cache_clear()
+
+
 def test_build_callback_public_url_requires_a_secure_public_base():
     with pytest.raises(ValidationError):
         Settings(_env_file=None, build_callback_public_url="http://deployforge.example.test")
@@ -378,7 +437,7 @@ def test_build_callback_rejects_oversized_body_before_parsing(client, monkeypatc
     _, _, _, run, callback_client = create_approved_release(client, monkeypatch)
     response = callback_client.post(
         f"/api/v1/build-runs/{run['id']}/callback",
-        content=b"{" + b" " * (256 * 1024),
+        content=b"{" + b" " * MAX_CALLBACK_BYTES,
         headers={
             "Content-Type": "application/json",
             "X-DeployForge-Timestamp": str(int(time.time())),

@@ -1,16 +1,26 @@
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import String, cast, func, or_, select
+from sqlalchemy import String, case, cast, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
 from app.api.deps import get_current_identity, get_db, require_csrf
 from app.core.audit import record_audit
 from app.core.authorization import require_workspace_access
-from app.models import GoldenPath, Service, ServiceTeam, User, UserSession
+from app.core.config import settings
+from app.models import (
+    GitHubRepositoryProvisioning,
+    GoldenPath,
+    Service,
+    ServiceTeam,
+    User,
+    UserSession,
+)
 from app.schemas.core import (
+    GitHubRepositoryProvisioningContract,
     GoldenPathContract,
     GoldenPathInstantiate,
     ServiceCatalogResponse,
@@ -206,13 +216,179 @@ def list_golden_paths(
     workspace_id: UUID,
     identity: tuple[User, UserSession] = Depends(get_current_identity),
     db: Session = Depends(get_db),
-) -> list[GoldenPath]:
+) -> list[GoldenPathContract]:
     require_workspace_access(db, identity[0], workspace_id)
-    return list(
+    paths = list(
         db.scalars(
             select(GoldenPath).where(GoldenPath.status == "available").order_by(GoldenPath.name)
         ).all()
     )
+    return [
+        GoldenPathContract.model_validate(path).model_copy(
+            update={
+                "repository_bootstrap_available": bool(
+                    settings.github_repository_owner
+                    and settings.github_template_for_path(path.slug)
+                )
+            }
+        )
+        for path in paths
+    ]
+
+
+@router.get(
+    "/workspaces/{workspace_id}/repository-provisionings",
+    response_model=list[GitHubRepositoryProvisioningContract],
+    summary="List durable Golden Path repository bootstrap jobs",
+)
+def list_repository_provisionings(
+    workspace_id: UUID,
+    limit: int = Query(default=100, ge=1, le=200),
+    identity: tuple[User, UserSession] = Depends(get_current_identity),
+    db: Session = Depends(get_db),
+) -> list[GitHubRepositoryProvisioning]:
+    require_workspace_access(db, identity[0], workspace_id)
+    return list(
+        db.scalars(
+            select(GitHubRepositoryProvisioning)
+            .where(GitHubRepositoryProvisioning.workspace_id == workspace_id)
+            .order_by(
+                case(
+                    (GitHubRepositoryProvisioning.status.in_(("queued", "dispatching")), 0),
+                    else_=1,
+                ),
+                GitHubRepositoryProvisioning.created_at.desc(),
+                GitHubRepositoryProvisioning.id,
+            )
+            .limit(limit)
+        ).all()
+    )
+
+
+@router.post(
+    "/workspaces/{workspace_id}/services/{service_id}/repository-provisioning",
+    response_model=GitHubRepositoryProvisioningContract,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Queue GitHub repository creation from a trusted Golden Path template",
+)
+def create_repository_provisioning(
+    workspace_id: UUID,
+    service_id: UUID,
+    identity: tuple[User, UserSession] = Depends(require_csrf),
+    db: Session = Depends(get_db),
+) -> GitHubRepositoryProvisioning:
+    actor = identity[0]
+    require_workspace_access(db, actor, workspace_id, roles=CATALOG_WRITER_ROLES)
+    if not settings.github_repository_provisioning_configured:
+        raise HTTPException(
+            status_code=409, detail="GitHub repository provisioning is not configured"
+        )
+    service = _load_service(db, workspace_id, service_id)
+    if service.repository_url:
+        raise HTTPException(status_code=409, detail="This service already has a repository")
+    golden_path_slug = (
+        service.golden_path.slug
+        if service.golden_path
+        else (service.golden_path_snapshot or {}).get("slug")
+    )
+    template = settings.github_template_for_path(golden_path_slug)
+    if not golden_path_slug or template is None:
+        raise HTTPException(
+            status_code=409,
+            detail="No GitHub repository template is configured for this Golden Path",
+        )
+    provisioning = GitHubRepositoryProvisioning(
+        workspace_id=workspace_id,
+        service_id=service.id,
+        requested_by=actor.id,
+        golden_path_slug=golden_path_slug,
+        repository_owner=settings.github_repository_owner,
+        repository_name=service.slug,
+        template_owner=template[0],
+        template_name=template[1],
+        is_private=settings.github_repository_private,
+        status="queued",
+    )
+    db.add(provisioning)
+    try:
+        db.flush()
+        record_audit(
+            db,
+            actor=actor,
+            action="catalog.repository_provisioning.queued",
+            resource_type="github_repository_provisioning",
+            resource_id=provisioning.id,
+            workspace_id=workspace_id,
+            details={
+                "service_id": str(service.id),
+                "golden_path_slug": golden_path_slug,
+                "repository_owner": provisioning.repository_owner,
+                "repository_name": provisioning.repository_name,
+                "private": provisioning.is_private,
+            },
+        )
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="A repository provisioning request already exists for this service",
+        ) from exc
+    db.refresh(provisioning)
+    return provisioning
+
+
+@router.post(
+    "/workspaces/{workspace_id}/repository-provisionings/{provisioning_id}/retry",
+    response_model=GitHubRepositoryProvisioningContract,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Retry a blocked Golden Path repository bootstrap",
+)
+def retry_repository_provisioning(
+    workspace_id: UUID,
+    provisioning_id: UUID,
+    identity: tuple[User, UserSession] = Depends(require_csrf),
+    db: Session = Depends(get_db),
+) -> GitHubRepositoryProvisioning:
+    actor = identity[0]
+    require_workspace_access(db, actor, workspace_id, roles=CATALOG_WRITER_ROLES)
+    provisioning = db.scalar(
+        select(GitHubRepositoryProvisioning).where(
+            GitHubRepositoryProvisioning.workspace_id == workspace_id,
+            GitHubRepositoryProvisioning.id == provisioning_id,
+        )
+    )
+    if provisioning is None:
+        raise HTTPException(status_code=404, detail="Repository provisioning request not found")
+    if provisioning.status != "blocked":
+        raise HTTPException(
+            status_code=409, detail="Only blocked repository requests can be retried"
+        )
+    if not settings.github_repository_provisioning_configured:
+        raise HTTPException(
+            status_code=409, detail="GitHub repository provisioning is not configured"
+        )
+    provisioning.status = "queued"
+    provisioning.attempt_count = 0
+    provisioning.available_at = datetime.now(UTC)
+    provisioning.lease_owner = None
+    provisioning.lease_expires_at = None
+    provisioning.failure_code = None
+    provisioning.failure_message = None
+    provisioning.finished_at = None
+    provisioning.updated_at = datetime.now(UTC)
+    record_audit(
+        db,
+        actor=actor,
+        action="catalog.repository_provisioning.retried",
+        resource_type="github_repository_provisioning",
+        resource_id=provisioning.id,
+        workspace_id=workspace_id,
+        details={"service_id": str(provisioning.service_id)},
+    )
+    db.commit()
+    db.refresh(provisioning)
+    return provisioning
 
 
 @router.get(
@@ -283,7 +459,7 @@ def list_services(
     services = (
         db.scalars(
             query.options(joinedload(Service.team), joinedload(Service.golden_path))
-            .order_by(Service.name)
+            .order_by(Service.name, Service.id)
             .limit(limit)
             .offset(offset)
         )
