@@ -5,16 +5,15 @@ Revises:
 Create Date: 2026-10-25 09:35:20.046318
 """
 
-from typing import Sequence, Union
+from collections.abc import Sequence
 
-from alembic import op
 import sqlalchemy as sa
-
+from alembic import op
 
 revision: str = '21ace85439ec'
-down_revision: Union[str, None] = None
-branch_labels: Union[str, Sequence[str], None] = None
-depends_on: Union[str, Sequence[str], None] = None
+down_revision: str | None = None
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
@@ -49,8 +48,15 @@ def upgrade() -> None:
     sa.ForeignKeyConstraint(['workspace_id'], ['workspaces.id'], ondelete='SET NULL'),
     sa.PrimaryKeyConstraint('id')
     )
-    op.create_index('ix_audit_events_resource', 'audit_events', ['resource_type', 'resource_id'], unique=False)
-    op.create_index('ix_audit_events_workspace_created_at', 'audit_events', ['workspace_id', 'created_at'], unique=False)
+    op.create_index(
+        'ix_audit_events_resource', 'audit_events', ['resource_type', 'resource_id'], unique=False
+    )
+    op.create_index(
+        'ix_audit_events_workspace_created_at',
+        'audit_events',
+        ['workspace_id', 'created_at'],
+        unique=False,
+    )
     op.create_table('environments',
     sa.Column('id', sa.Uuid(), nullable=False),
     sa.Column('workspace_id', sa.Uuid(), nullable=False),
@@ -94,7 +100,12 @@ def upgrade() -> None:
     sa.PrimaryKeyConstraint('id')
     )
     op.create_index('ix_deployments_service_id', 'deployments', ['service_id'], unique=False)
-    op.create_index('ix_deployments_workspace_created_at', 'deployments', ['workspace_id', 'created_at'], unique=False)
+    op.create_index(
+        'ix_deployments_workspace_created_at',
+        'deployments',
+        ['workspace_id', 'created_at'],
+        unique=False,
+    )
     # ### end Alembic commands ###
 
 

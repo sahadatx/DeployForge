@@ -5,16 +5,15 @@ Revises: 21ace85439ec
 Create Date: 2026-10-25 09:47:15.441737
 """
 
-from typing import Sequence, Union
+from collections.abc import Sequence
 
-from alembic import op
 import sqlalchemy as sa
-
+from alembic import op
 
 revision: str = '300637d2a933'
-down_revision: Union[str, None] = '21ace85439ec'
-branch_labels: Union[str, Sequence[str], None] = None
-depends_on: Union[str, Sequence[str], None] = None
+down_revision: str | None = '21ace85439ec'
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
@@ -47,7 +46,9 @@ def upgrade() -> None:
     sa.PrimaryKeyConstraint('id'),
     sa.UniqueConstraint('token_hash', name='uq_user_sessions_token_hash')
     )
-    op.create_index('ix_user_sessions_user_expires', 'user_sessions', ['user_id', 'expires_at'], unique=False)
+    op.create_index(
+        'ix_user_sessions_user_expires', 'user_sessions', ['user_id', 'expires_at'], unique=False
+    )
     op.create_table('workspace_memberships',
     sa.Column('id', sa.Uuid(), nullable=False),
     sa.Column('workspace_id', sa.Uuid(), nullable=False),
@@ -61,7 +62,9 @@ def upgrade() -> None:
     sa.PrimaryKeyConstraint('id'),
     sa.UniqueConstraint('workspace_id', 'user_id', name='uq_workspace_memberships_workspace_user')
     )
-    op.create_index('ix_workspace_memberships_user_id', 'workspace_memberships', ['user_id'], unique=False)
+    op.create_index(
+        'ix_workspace_memberships_user_id', 'workspace_memberships', ['user_id'], unique=False
+    )
     # ### end Alembic commands ###
 
 

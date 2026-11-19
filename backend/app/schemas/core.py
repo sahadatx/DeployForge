@@ -1,6 +1,6 @@
 import json
 import re
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
 from uuid import UUID
@@ -23,6 +23,12 @@ ArgoApplicationName = Annotated[
     str,
     StringConstraints(
         pattern=r"^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$", min_length=1, max_length=253
+    ),
+]
+FluxNamespace = Annotated[
+    str,
+    StringConstraints(
+        pattern=r"^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$", min_length=1, max_length=63
     ),
 ]
 WorkspaceSlug = Annotated[
@@ -92,7 +98,17 @@ class EnvironmentContract(BaseModel):
     quota_pods: int | None = None
     quota_persistent_volume_claims: int | None = None
     quota_services: int | None = None
+    deployment_freeze_start_at: datetime | None = None
+    deployment_freeze_until: datetime | None = None
+    deployment_freeze_reason: str | None = None
     created_at: datetime
+
+    @field_validator("deployment_freeze_start_at", "deployment_freeze_until", mode="before")
+    @classmethod
+    def normalize_freeze_times_to_utc(cls, value: datetime | None) -> datetime | None:
+        if value is not None and value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value
 
 
 class EnvironmentCreate(BaseModel):
@@ -156,6 +172,28 @@ class EnvironmentPatch(BaseModel):
         if value == "":
             raise ValueError("Environment name cannot be blank")
         return value
+
+
+class DeploymentFreezeRequest(BaseModel):
+    starts_at: AwareDatetime
+    ends_at: AwareDatetime
+    reason: str = Field(min_length=10, max_length=2000)
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def trim_freeze_reason(cls, value: str) -> str:
+        return value.strip() if isinstance(value, str) else value
+
+    @model_validator(mode="after")
+    def validate_window(self):
+        now = datetime.now(UTC)
+        if self.ends_at <= self.starts_at:
+            raise ValueError("Freeze end time must be after its start time")
+        if self.starts_at.timestamp() < now.timestamp() - 60:
+            raise ValueError("Freeze start time cannot be more than one minute in the past")
+        if (self.ends_at - self.starts_at).total_seconds() > 30 * 24 * 60 * 60:
+            raise ValueError("A deployment freeze cannot exceed 30 days")
+        return self
 
 
 class InfrastructureTargetCreate(BaseModel):
@@ -757,6 +795,34 @@ class GoldenPathContract(BaseModel):
     capabilities: list[str] = Field(default_factory=list)
     config_schema: list[dict[str, Any]] = Field(default_factory=list)
     defaults: dict[str, Any] = Field(default_factory=dict)
+    repository_bootstrap_available: bool = False
+
+
+class GitHubRepositoryProvisioningContract(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    workspace_id: UUID
+    service_id: UUID
+    requested_by: UUID | None = None
+    golden_path_slug: str
+    repository_owner: str
+    repository_name: str
+    template_owner: str
+    template_name: str
+    is_private: bool
+    status: str
+    attempt_count: int
+    max_attempts: int
+    external_repository_id: str | None = None
+    repository_url: str | None = None
+    default_branch: str | None = None
+    failure_code: str | None = None
+    failure_message: str | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
 
 
 class ServiceCreate(BaseModel):
@@ -852,6 +918,8 @@ class DeploymentContract(BaseModel):
     environment_id: UUID
     version: str
     source_ref: str | None = None
+    promoted_artifact_id: UUID | None = None
+    promotion_gitops_revision: str | None = None
     status: str
     requested_by: str | None = None
     idempotency_key: str | None = None
@@ -872,6 +940,8 @@ class DeploymentRequest(BaseModel):
     environment_id: UUID
     version: str = Field(min_length=1, max_length=160)
     source_ref: str | None = Field(default=None, min_length=1, max_length=255)
+    artifact_id: UUID | None = None
+    gitops_revision: str | None = Field(default=None, pattern=r"^[0-9a-f]{40,64}$")
 
     @field_validator("version", mode="before")
     @classmethod
@@ -882,6 +952,30 @@ class DeploymentRequest(BaseModel):
     @classmethod
     def strip_source_ref(cls, value: str | None) -> str | None:
         return value.strip() if isinstance(value, str) else value
+
+    @model_validator(mode="after")
+    def validate_artifact_promotion(self) -> "DeploymentRequest":
+        if (self.artifact_id is None) != (self.gitops_revision is None):
+            raise ValueError(
+                "Artifact promotion requires both an artifact_id and immutable gitops_revision"
+            )
+        return self
+
+
+class PromotableArtifactContract(BaseModel):
+    id: UUID
+    name: str
+    uri: str
+    digest: str
+    artifact_type: str
+    evidence_status: str
+    source_build_run_id: UUID
+    source_deployment_id: UUID
+    source_environment_id: UUID
+    source_version: str
+    source_ref: str
+    commit_sha: str | None = None
+    created_at: datetime
 
 
 class DeploymentEventContract(BaseModel):
@@ -915,16 +1009,20 @@ class GitOpsTargetCreate(BaseModel):
     service_id: UUID
     environment_id: UUID
     application_name: ArgoApplicationName
+    provider: Literal["argocd", "flux"] = "argocd"
     expected_project: str = Field(default="default", min_length=1, max_length=80)
     expected_cluster_name: str | None = Field(default=None, max_length=180)
+    reconciliation_namespace: FluxNamespace | None = None
     artifact_name: str | None = Field(default=None, min_length=1, max_length=180)
     enabled: bool = True
 
 
 class GitOpsTargetPatch(BaseModel):
     application_name: ArgoApplicationName | None = None
+    provider: Literal["argocd", "flux"] | None = None
     expected_project: str | None = Field(default=None, min_length=1, max_length=80)
     expected_cluster_name: str | None = Field(default=None, max_length=180)
+    reconciliation_namespace: FluxNamespace | None = None
     artifact_name: str | None = Field(default=None, min_length=1, max_length=180)
     enabled: bool | None = None
 
@@ -937,8 +1035,10 @@ class GitOpsTargetContract(BaseModel):
     service_id: UUID
     environment_id: UUID
     application_name: str
+    provider: str
     expected_project: str
     expected_cluster_name: str | None = None
+    reconciliation_namespace: str | None = None
     artifact_name: str | None = None
     enabled: bool
     created_at: datetime
@@ -947,6 +1047,7 @@ class GitOpsTargetContract(BaseModel):
 
 class ArgoApplicationStatus(BaseModel):
     application_name: str
+    provider: str = "argocd"
     provider_status: str
     failure_code: str | None = None
     project: str | None = None
@@ -956,6 +1057,8 @@ class ArgoApplicationStatus(BaseModel):
     revision: str | None = None
     destination_name: str | None = None
     destination_server: str | None = None
+    namespace: str | None = None
+    run_status: str | None = None
 
 
 class GitOpsRunContract(BaseModel):
@@ -980,6 +1083,8 @@ class GitOpsRunContract(BaseModel):
     operation_phase: str | None = None
     destination_name: str | None = None
     destination_server: str | None = None
+    rollout_snapshot: dict[str, Any] | None = None
+    rollout_updated_at: datetime | None = None
     attempt_count: int
     max_attempts: int
     callback_deadline_at: datetime | None = None
@@ -1008,8 +1113,34 @@ class GitOpsRunEventContract(BaseModel):
     created_at: datetime
 
 
+class GitOpsRolloutActionCreate(BaseModel):
+    comment: str = Field(min_length=3, max_length=1000)
+
+
+class GitOpsRolloutActionContract(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    gitops_run_id: UUID
+    workspace_id: UUID
+    requested_by: UUID | None = None
+    action: str
+    status: str
+    comment: str
+    requested_step: str | None = None
+    requested_rollout_status: str | None = None
+    attempt_count: int
+    failure_code: str | None = None
+    failure_message: str | None = None
+    dispatched_at: datetime | None = None
+    completed_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
 class GitOpsRunDetail(GitOpsRunContract):
     events: list[GitOpsRunEventContract] = Field(default_factory=list)
+    rollout_actions: list[GitOpsRolloutActionContract] = Field(default_factory=list)
 
 
 class BuildRunContract(BaseModel):
@@ -1094,7 +1225,11 @@ class BuildArtifactEvidence(BaseModel):
     sbom_uri: str = Field(max_length=1000)
     sbom_digest: Digest
     sbom_bundle: dict[str, Any] | None = None
+    vulnerability_uri: str | None = Field(default=None, max_length=1000)
     vulnerability_summary: VulnerabilitySummary
+    vulnerability_report_digest: Digest | None = None
+    vulnerability_scanner_version: str | None = Field(default=None, max_length=100)
+    vulnerability_evidence_bundle: dict[str, Any] | None = None
     signature_uri: str = Field(max_length=1000)
     signature_bundle: dict[str, Any] | None = None
     signer_identity: str = Field(min_length=1, max_length=500)
@@ -1103,7 +1238,7 @@ class BuildArtifactEvidence(BaseModel):
     provenance_digest: Digest
     provenance_bundle: dict[str, Any] | None = None
 
-    @field_validator("uri", "sbom_uri", "signature_uri", "provenance_uri")
+    @field_validator("uri", "sbom_uri", "signature_uri", "provenance_uri", "vulnerability_uri")
     @classmethod
     def validate_evidence_locations(cls, value: str) -> str:
         return _safe_evidence_url(value)
@@ -1115,7 +1250,7 @@ class BuildArtifactEvidence(BaseModel):
 
     @field_validator("signature_bundle", "provenance_bundle")
     @classmethod
-    def limit_inline_bundle_size(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
+    def limit_small_inline_bundle_size(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
         bundle_size = (
             len(json.dumps(value, separators=(",", ":")).encode("utf-8"))
             if value is not None
@@ -1123,6 +1258,18 @@ class BuildArtifactEvidence(BaseModel):
         )
         if bundle_size > 100 * 1024:
             raise ValueError("Each inline Sigstore bundle must be at most 100 KiB")
+        return value
+
+    @field_validator("vulnerability_evidence_bundle")
+    @classmethod
+    def limit_scanner_bundle_size(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
+        bundle_size = (
+            len(json.dumps(value, separators=(",", ":")).encode("utf-8"))
+            if value is not None
+            else 0
+        )
+        if bundle_size > 256 * 1024:
+            raise ValueError("The scanner attestation bundle must be at most 256 KiB")
         return value
 
     @field_validator("sbom_bundle")
@@ -1148,9 +1295,7 @@ class BuildCallbackRequest(BaseModel):
     external_run_id: str = Field(min_length=1, max_length=120)
     run_url: str = Field(max_length=1000)
     commit_sha: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{40,64}$")]
-    gitops_revision: Annotated[
-        str | None, StringConstraints(pattern=r"^[0-9a-f]{40,64}$")
-    ] = None
+    gitops_revision: Annotated[str | None, StringConstraints(pattern=r"^[0-9a-f]{40,64}$")] = None
     status: Literal["running", "succeeded", "failed"]
     failure_message: str | None = Field(default=None, max_length=1000)
     artifacts: list[BuildArtifactEvidence] = Field(default_factory=list, max_length=20)
@@ -1184,7 +1329,10 @@ class BuildArtifactContract(BaseModel):
     sbom_format: str
     sbom_uri: str
     sbom_digest: str
+    vulnerability_uri: str | None = None
     vulnerability_summary: dict[str, int]
+    vulnerability_report_digest: str | None = None
+    vulnerability_scanner_version: str | None = None
     signature_uri: str
     signer_identity: str
     oidc_issuer: str
@@ -1236,9 +1384,9 @@ class WorkspaceMemberContract(BaseModel):
     membership_id: UUID
     user: UserContract
     role: WorkspaceRole
-    identity_source: str
-    identity_groups: list[str]
     created_at: datetime
+    identity_source: str = "manual"
+    identity_groups: list[str] = Field(default_factory=list)
 
 
 class MembershipCreate(BaseModel):
@@ -1441,3 +1589,194 @@ class SloAlertContract(BaseModel):
     acknowledged_at: datetime | None = None
     resolved_at: datetime | None = None
     created_at: datetime
+
+
+IncidentSeverity = Literal["sev0", "sev1", "sev2", "sev3"]
+IncidentStatus = Literal["open", "investigating", "mitigated", "resolved", "closed"]
+IncidentSourceType = Literal["manual", "slo_alert", "deployment", "gitops"]
+
+
+class IncidentCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: str | None = Field(default=None, min_length=3, max_length=240)
+    description: str = Field(default="", max_length=8000)
+    severity: IncidentSeverity = "sev3"
+    service_id: UUID | None = None
+    environment_id: UUID | None = None
+    source_type: IncidentSourceType = "manual"
+    source_id: UUID | None = None
+
+    @model_validator(mode="after")
+    def validate_source(self) -> "IncidentCreate":
+        if (self.source_type == "manual") != (self.source_id is None):
+            raise ValueError(
+                "Manual incidents cannot reference a source; signal incidents require one"
+            )
+        if self.source_type == "manual" and self.title is None:
+            raise ValueError("Manual incidents require a title")
+        return self
+
+    @field_validator("title", mode="before")
+    @classmethod
+    def strip_incident_title(cls, value: str | None) -> str | None:
+        return value.strip() if isinstance(value, str) else value
+
+    @field_validator("description", mode="before")
+    @classmethod
+    def strip_incident_description(cls, value: str) -> str:
+        return value.strip() if isinstance(value, str) else value
+
+
+class IncidentContract(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    workspace_id: UUID
+    service_id: UUID | None
+    environment_id: UUID | None
+    source_type: IncidentSourceType
+    source_id: UUID | None
+    title: str
+    description: str
+    severity: IncidentSeverity
+    status: IncidentStatus
+    resolution: str | None
+    assigned_to: UUID | None
+    opened_by: UUID | None
+    escalation_level: int
+    next_escalation_at: datetime | None
+    opened_at: datetime
+    mitigated_at: datetime | None
+    resolved_at: datetime | None
+    closed_at: datetime | None
+    pagerduty_triggered_at: datetime | None
+    pagerduty_resolved_notified_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class IncidentAssignment(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    assignee_id: UUID | None
+    comment: str | None = Field(default=None, max_length=1000)
+
+    @field_validator("comment", mode="before")
+    @classmethod
+    def strip_assignment_comment(cls, value: str | None) -> str | None:
+        cleaned = value.strip() if isinstance(value, str) else value
+        return cleaned or None
+
+
+class IncidentEscalation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    assignee_id: UUID | None = None
+    next_escalation_at: AwareDatetime | None = None
+    comment: str = Field(min_length=3, max_length=1000)
+
+    @field_validator("comment", mode="before")
+    @classmethod
+    def strip_escalation_comment(cls, value: str) -> str:
+        return value.strip() if isinstance(value, str) else value
+
+
+class IncidentTransition(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["investigating", "mitigated", "resolved", "closed"]
+    comment: str = Field(min_length=3, max_length=1000)
+    resolution: str | None = Field(default=None, max_length=8000)
+
+    @field_validator("comment", mode="before")
+    @classmethod
+    def strip_transition_comment(cls, value: str) -> str:
+        return value.strip() if isinstance(value, str) else value
+
+    @field_validator("resolution", mode="before")
+    @classmethod
+    def strip_resolution(cls, value: str | None) -> str | None:
+        cleaned = value.strip() if isinstance(value, str) else value
+        return cleaned or None
+
+
+class IncidentEventContract(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    incident_id: UUID
+    workspace_id: UUID
+    sequence: int
+    event_type: str
+    from_status: str | None
+    to_status: str | None
+    actor_type: str
+    actor_id: str | None
+    message: str
+    details: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+
+
+class IncidentPostmortemUpsert(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: str = Field(min_length=3, max_length=240)
+    summary: str = Field(min_length=10, max_length=8000)
+    impact: str = Field(min_length=10, max_length=8000)
+    root_cause: str = Field(min_length=10, max_length=8000)
+    detection: str = Field(min_length=10, max_length=8000)
+    response: str = Field(min_length=10, max_length=8000)
+    corrective_actions: list[str] = Field(min_length=1, max_length=50)
+    due_at: AwareDatetime | None = None
+
+    @field_validator(
+        "title", "summary", "impact", "root_cause", "detection", "response", mode="before"
+    )
+    @classmethod
+    def strip_postmortem_text(cls, value: str) -> str:
+        return value.strip() if isinstance(value, str) else value
+
+    @field_validator("corrective_actions")
+    @classmethod
+    def validate_corrective_actions(cls, actions: list[str]) -> list[str]:
+        normalized = [action.strip() for action in actions]
+        if any(not action or len(action) > 1000 for action in normalized):
+            raise ValueError("Corrective actions must be non-blank and at most 1000 characters")
+        return normalized
+
+
+class IncidentPostmortemContract(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    incident_id: UUID
+    workspace_id: UUID
+    status: Literal["draft", "in_review", "published"]
+    title: str
+    summary: str
+    impact: str
+    root_cause: str
+    detection: str
+    response: str
+    corrective_actions: list[str]
+    author_id: UUID | None
+    reviewer_id: UUID | None
+    review_comment: str | None
+    submitted_at: datetime | None
+    published_at: datetime | None
+    due_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class IncidentPostmortemReview(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decision: Literal["approve", "reject"]
+    comment: str = Field(min_length=3, max_length=1000)
+
+    @field_validator("comment", mode="before")
+    @classmethod
+    def strip_review_comment(cls, value: str) -> str:
+        return value.strip() if isinstance(value, str) else value

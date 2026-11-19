@@ -55,7 +55,6 @@ class User(Base):
     __table_args__ = (
         UniqueConstraint("issuer", "subject", name="uq_users_issuer_subject"),
         UniqueConstraint("email", name="uq_users_email"),
-        UniqueConstraint("scim_external_id", name="uq_users_scim_external_id"),
         Index("ix_users_active_email", "active", "email"),
     )
 
@@ -64,6 +63,7 @@ class User(Base):
     subject: Mapped[str] = mapped_column(String(255), nullable=False)
     email: Mapped[str] = mapped_column(String(320), nullable=False)
     display_name: Mapped[str] = mapped_column(String(180), nullable=False)
+    password_hash: Mapped[str | None] = mapped_column(String(512))
     email_verified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     scim_external_id: Mapped[str | None] = mapped_column(String(255))
     is_platform_admin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
@@ -93,10 +93,7 @@ class User(Base):
 
 class SCIMGroup(Base):
     __tablename__ = "scim_groups"
-    __table_args__ = (
-        UniqueConstraint("display_name", name="uq_scim_groups_display_name"),
-        UniqueConstraint("external_id", name="uq_scim_groups_external_id"),
-    )
+    __table_args__ = (UniqueConstraint("display_name", name="uq_scim_groups_display_name"),)
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     external_id: Mapped[str | None] = mapped_column(String(255))
@@ -147,11 +144,9 @@ class WorkspaceMembership(Base):
     )
     role: Mapped[str] = mapped_column(String(40), nullable=False)
     identity_source: Mapped[str] = mapped_column(
-        String(40), default="manual", server_default=text("'manual'"), nullable=False
+        String(40), default="manual", server_default="manual", nullable=False
     )
-    identity_groups: Mapped[list] = mapped_column(
-        JSON, default=list, server_default=text("'[]'"), nullable=False
-    )
+    identity_groups: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
     granted_by: Mapped[uuid.UUID | None] = mapped_column(
         Uuid, ForeignKey("users.id", ondelete="SET NULL")
     )
@@ -190,6 +185,9 @@ class Environment(Base):
     quota_pods: Mapped[int | None] = mapped_column()
     quota_persistent_volume_claims: Mapped[int | None] = mapped_column()
     quota_services: Mapped[int | None] = mapped_column()
+    deployment_freeze_start_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    deployment_freeze_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    deployment_freeze_reason: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )
@@ -304,6 +302,67 @@ class Service(Base):
     golden_path: Mapped[GoldenPath | None] = relationship(back_populates="services")
     deployments: Mapped[list["Deployment"]] = relationship(back_populates="service")
     gitops_targets: Mapped[list["GitOpsTarget"]] = relationship(back_populates="service")
+    repository_provisionings: Mapped[list["GitHubRepositoryProvisioning"]] = relationship(
+        back_populates="service",
+        cascade="all, delete-orphan",
+        order_by="GitHubRepositoryProvisioning.created_at",
+    )
+
+
+class GitHubRepositoryProvisioning(Base):
+    """Durable request to generate a service repository from a trusted template."""
+
+    __tablename__ = "github_repository_provisionings"
+    __table_args__ = (
+        Index("ix_github_repository_provisionings_status_available", "status", "available_at"),
+        Index("ix_github_repository_provisionings_workspace_created", "workspace_id", "created_at"),
+        Index(
+            "uq_github_repository_provisionings_service",
+            "service_id",
+            unique=True,
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False
+    )
+    service_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("services.id", ondelete="CASCADE"), nullable=False
+    )
+    requested_by: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("users.id", ondelete="SET NULL")
+    )
+    golden_path_slug: Mapped[str] = mapped_column(String(100), nullable=False)
+    repository_owner: Mapped[str] = mapped_column(String(100), nullable=False)
+    repository_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    template_owner: Mapped[str] = mapped_column(String(100), nullable=False)
+    template_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    is_private: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default="queued", nullable=False)
+    attempt_count: Mapped[int] = mapped_column(default=0, nullable=False)
+    max_attempts: Mapped[int] = mapped_column(default=5, nullable=False)
+    available_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    lease_owner: Mapped[str | None] = mapped_column(String(120))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    external_repository_id: Mapped[str | None] = mapped_column(String(80))
+    repository_url: Mapped[str | None] = mapped_column(String(500))
+    default_branch: Mapped[str | None] = mapped_column(String(255))
+    failure_code: Mapped[str | None] = mapped_column(String(80))
+    failure_message: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+    workspace: Mapped[Workspace] = relationship()
+    service: Mapped[Service] = relationship(back_populates="repository_provisionings")
 
 
 class Deployment(Base):
@@ -311,6 +370,7 @@ class Deployment(Base):
     __table_args__ = (
         Index("ix_deployments_workspace_created_at", "workspace_id", "created_at"),
         Index("ix_deployments_service_id", "service_id"),
+        Index("ix_deployments_promoted_artifact_id", "promoted_artifact_id"),
         Index("ix_deployments_status_available_at", "status", "available_at"),
         UniqueConstraint(
             "workspace_id", "idempotency_key", name="uq_deployments_workspace_idempotency"
@@ -329,6 +389,8 @@ class Deployment(Base):
     )
     version: Mapped[str] = mapped_column(String(160), nullable=False)
     source_ref: Mapped[str | None] = mapped_column(String(255))
+    promoted_artifact_id: Mapped[uuid.UUID | None] = mapped_column(Uuid)
+    promotion_gitops_revision: Mapped[str | None] = mapped_column(String(64))
     status: Mapped[str] = mapped_column(String(40), default="queued", nullable=False)
     requested_by: Mapped[str | None] = mapped_column(String(180))
     idempotency_key: Mapped[str | None] = mapped_column(String(128))
@@ -510,7 +572,10 @@ class BuildArtifact(Base):
     sbom_format: Mapped[str] = mapped_column(String(40), nullable=False)
     sbom_uri: Mapped[str] = mapped_column(String(1000), nullable=False)
     sbom_digest: Mapped[str] = mapped_column(String(80), nullable=False)
+    vulnerability_uri: Mapped[str | None] = mapped_column(String(1000))
     vulnerability_summary: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    vulnerability_report_digest: Mapped[str | None] = mapped_column(String(80))
+    vulnerability_scanner_version: Mapped[str | None] = mapped_column(String(100))
     signature_uri: Mapped[str] = mapped_column(String(1000), nullable=False)
     signer_identity: Mapped[str] = mapped_column(String(500), nullable=False)
     oidc_issuer: Mapped[str] = mapped_column(String(500), nullable=False)
@@ -552,8 +617,12 @@ class GitOpsTarget(Base):
         Uuid, ForeignKey("environments.id", ondelete="CASCADE"), nullable=False
     )
     application_name: Mapped[str] = mapped_column(String(253), nullable=False)
+    provider: Mapped[str] = mapped_column(
+        String(24), default="argocd", server_default=text("'argocd'"), nullable=False
+    )
     expected_project: Mapped[str] = mapped_column(String(80), default="default", nullable=False)
     expected_cluster_name: Mapped[str | None] = mapped_column(String(180))
+    reconciliation_namespace: Mapped[str | None] = mapped_column(String(63))
     artifact_name: Mapped[str | None] = mapped_column(String(180))
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_by: Mapped[uuid.UUID | None] = mapped_column(
@@ -615,6 +684,8 @@ class GitOpsRun(Base):
     max_attempts: Mapped[int] = mapped_column(default=3, nullable=False)
     next_poll_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     callback_deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    rollout_snapshot: Mapped[dict | None] = mapped_column(JSON)
+    rollout_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     lease_owner: Mapped[str | None] = mapped_column(String(120))
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     failure_code: Mapped[str | None] = mapped_column(String(80))
@@ -636,6 +707,11 @@ class GitOpsRun(Base):
         back_populates="gitops_run",
         cascade="all, delete-orphan",
         order_by="GitOpsRunEvent.sequence",
+    )
+    rollout_actions: Mapped[list["GitOpsRolloutAction"]] = relationship(
+        back_populates="gitops_run",
+        cascade="all, delete-orphan",
+        order_by="GitOpsRolloutAction.created_at",
     )
 
 
@@ -666,6 +742,58 @@ class GitOpsRunEvent(Base):
     )
 
     gitops_run: Mapped[GitOpsRun] = relationship(back_populates="events")
+
+
+class GitOpsRolloutAction(Base):
+    """Durable, audited manual step promotion and abort operations."""
+
+    __tablename__ = "gitops_rollout_actions"
+    __table_args__ = (
+        Index("ix_gitops_rollout_actions_status_available", "status", "available_at"),
+        Index("ix_gitops_rollout_actions_workspace_created", "workspace_id", "created_at"),
+        Index(
+            "uq_gitops_rollout_actions_active_run",
+            "gitops_run_id",
+            unique=True,
+            sqlite_where=text("status IN ('queued', 'dispatching')"),
+            postgresql_where=text("status IN ('queued', 'dispatching')"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    gitops_run_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("gitops_runs.id", ondelete="CASCADE"), nullable=False
+    )
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False
+    )
+    requested_by: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("users.id", ondelete="SET NULL")
+    )
+    action: Mapped[str] = mapped_column(String(16), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), default="queued", nullable=False)
+    comment: Mapped[str] = mapped_column(String(1000), nullable=False)
+    requested_step: Mapped[str | None] = mapped_column(String(180))
+    requested_rollout_status: Mapped[str | None] = mapped_column(String(40))
+    attempt_count: Mapped[int] = mapped_column(default=0, nullable=False)
+    max_attempts: Mapped[int] = mapped_column(default=5, nullable=False)
+    available_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    lease_owner: Mapped[str | None] = mapped_column(String(120))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    failure_code: Mapped[str | None] = mapped_column(String(80))
+    failure_message: Mapped[str | None] = mapped_column(Text)
+    dispatched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+    gitops_run: Mapped[GitOpsRun] = relationship(back_populates="rollout_actions")
 
 
 class InfrastructureTarget(Base):
@@ -1157,8 +1285,135 @@ class SloAlert(Base):
     )
     acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    pagerduty_triggered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    pagerduty_resolved_notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    pagerduty_last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
+    )
+
+
+class Incident(Base):
+    """Workspace scoped incident record with deduplicated source and paging delivery."""
+
+    __tablename__ = "incidents"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "source_type", "source_id", name="uq_incidents_source"),
+        Index("ix_incidents_workspace_status_created", "workspace_id", "status", "created_at"),
+        Index("ix_incidents_workspace_service_created", "workspace_id", "service_id", "created_at"),
+        Index("ix_incidents_pagerduty_due", "status", "pagerduty_last_attempt_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False
+    )
+    service_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("services.id", ondelete="SET NULL")
+    )
+    environment_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("environments.id", ondelete="SET NULL")
+    )
+    source_type: Mapped[str] = mapped_column(String(24), default="manual", nullable=False)
+    source_id: Mapped[uuid.UUID | None] = mapped_column(Uuid)
+    title: Mapped[str] = mapped_column(String(240), nullable=False)
+    description: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    severity: Mapped[str] = mapped_column(String(8), default="sev3", nullable=False)
+    status: Mapped[str] = mapped_column(String(24), default="open", nullable=False)
+    resolution: Mapped[str | None] = mapped_column(Text)
+    assigned_to: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("users.id", ondelete="SET NULL")
+    )
+    opened_by: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("users.id", ondelete="SET NULL")
+    )
+    escalation_level: Mapped[int] = mapped_column(default=0, nullable=False)
+    next_escalation_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    opened_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    mitigated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    pagerduty_triggered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    pagerduty_resolved_notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    pagerduty_last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+
+class IncidentEvent(Base):
+    """Append-only response timeline; edits are represented as new events."""
+
+    __tablename__ = "incident_events"
+    __table_args__ = (
+        UniqueConstraint("incident_id", "sequence", name="uq_incident_events_sequence"),
+        Index("ix_incident_events_workspace_created", "workspace_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    incident_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("incidents.id", ondelete="CASCADE"), nullable=False
+    )
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False
+    )
+    sequence: Mapped[int] = mapped_column(nullable=False)
+    event_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    from_status: Mapped[str | None] = mapped_column(String(24))
+    to_status: Mapped[str | None] = mapped_column(String(24))
+    actor_type: Mapped[str] = mapped_column(String(24), nullable=False)
+    actor_id: Mapped[str | None] = mapped_column(String(180))
+    message: Mapped[str] = mapped_column(String(1000), nullable=False)
+    details: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+
+
+class IncidentPostmortem(Base):
+    """Reviewable postmortem draft, published only by a different reviewer."""
+
+    __tablename__ = "incident_postmortems"
+    __table_args__ = (
+        UniqueConstraint("incident_id", name="uq_incident_postmortems_incident"),
+        Index("ix_incident_postmortems_workspace_status", "workspace_id", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    incident_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("incidents.id", ondelete="CASCADE"), nullable=False
+    )
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(String(16), default="draft", nullable=False)
+    title: Mapped[str] = mapped_column(String(240), nullable=False)
+    summary: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    impact: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    root_cause: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    detection: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    response: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    corrective_actions: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    author_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("users.id", ondelete="SET NULL")
+    )
+    reviewer_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("users.id", ondelete="SET NULL")
+    )
+    review_comment: Mapped[str | None] = mapped_column(String(1000))
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
     )
 
 
